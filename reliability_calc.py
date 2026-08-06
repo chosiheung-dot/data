@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 reliability_calc.py
-원본 데스크톱 프로그램(신뢰성분석.py, tkinter)의 계산 로직 + DB 데이터를
-UI 코드 없이 그대로 옮긴 순수 계산 모듈.
+원본 데스크톱 프로그램(신뢰성분석.py, tkinter)의 계산 로직과 DB를 그대로 이식.
+- 탭① 온도가속(Arrhenius)
+- 탭② 온습도가속(Arrhenius-Peck)
+- 탭③ 열피로가속(Thermal Cycling) - Coffin-Manson / Modified Norris-Landzberg
+- 탭④ Weibull 시험시간비 계산기 + 참고 DB
+- 탭⑤ 수명데이터 분석 - Weibull MLE -> MTTF/B10/B1/R(t) + 확률도표
 """
 import math
 
@@ -314,9 +318,8 @@ MODEL_GUIDE_TEXT = """[ 언제 어떤 모델을 써야 하나요? ]
 * 시험온도는 부품 정격범위, 유리전이온도(Tg), 솔더 융점을 넘지 않아야 하며,
   유지시간은 DUT 내부/접합부 온도가 실제로 안정화되는 시간(통상 10~15분 이상) 이상이어야 합니다."""
 
-
 # ============================================================
-# 계산 함수 (온도가속/온습도가속/열피로가속/Weibull시험시간비)
+# 계산 함수
 # ============================================================
 def celsius_to_kelvin(c):
     return c + 273.15
@@ -363,7 +366,6 @@ def norris_landzberg_af(dT_field, dT_test, dwell_field, dwell_test,
 
 def profile_cycle_time_min(low_dwell, ramp_up, high_dwell, ramp_down):
     return low_dwell + ramp_up + high_dwell + ramp_down
-
 
 
 # ============================================================
@@ -501,4 +503,3 @@ def weibull_failure_rate(t, beta, eta):
     if t <= 0:
         t = 1e-9
     return (beta / eta) * (t / eta) ** (beta - 1)
-
