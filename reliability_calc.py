@@ -1,20 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 reliability_calc.py
-원본 데스크톱 프로그램(신뢰성분석.py, tkinter)의 계산 로직과 DB를 그대로 이식.
-- 탭① 온도가속(Arrhenius)
-- 탭② 온습도가속(Arrhenius-Peck)
-- 탭③ 열피로가속(Thermal Cycling) - Coffin-Manson / Modified Norris-Landzberg
-- 탭④ Weibull 시험시간비 계산기 + 참고 DB
-- 탭⑤ 수명데이터 분석 - Weibull MLE -> MTTF/B10/B1/R(t) + 확률도표
+가속시험 통합계산기 - 계산 로직 모듈 (원본 신뢰성분석.py의 계산 함수/DB를 그대로 이식)
 """
 import math
 
 K_BOLTZMANN = 8.6173e-05  # eV/K
 
-# ============================================================
-# DB : 활성화에너지 (Ea)
-# ============================================================
 EA_DB = [
     ('Capacitor, Aluminum Electrolytic', '0.81', 'EPRI NP-6408', 'Capacity Tol. 기준'),
     ('Capacitor, Mylar', '0.86', 'EPRI NP-6408', 'Capacity Tol. 기준'),
@@ -209,9 +201,6 @@ EA_DB = [
 
 ]
 
-# ============================================================
-# DB : Weibull Beta/Eta 참고값
-# ============================================================
 WEIBULL_DB = [
     ('Components', 'Ball bearings', 0.7, 1.3, 3.5, 14000.0, 40000.0, 250000.0),
     ('Components', 'Roller bearings', 0.7, 1.3, 3.5, 9000.0, 50000.0, 125000.0),
@@ -285,9 +274,6 @@ WEIBULL_DB = [
 
 ]
 
-# ============================================================
-# DB : Coffin-Manson m지수 선정 가이드
-# ============================================================
 M_GUIDE_DB = [
     ("무연솔더 적용 부품 Lead-free Solder(Sn97Ag3Cu0.5)", 2.65,
      "PCB 및 솔더링을 포함한 센서, 제어기류 (예: 무연솔더 적용 센서류)"),
@@ -316,10 +302,12 @@ MODEL_GUIDE_TEXT = """[ 언제 어떤 모델을 써야 하나요? ]
 
 * 판정 기준은 원칙적으로 '사이클 수' 입니다. 소요시간(분/시간/일)은 시험 스케줄링 참고용입니다.
 * 시험온도는 부품 정격범위, 유리전이온도(Tg), 솔더 융점을 넘지 않아야 하며,
-  유지시간은 DUT 내부/접합부 온도가 실제로 안정화되는 시간(통상 10~15분 이상) 이상이어야 합니다."""
+  유지시간은 DUT 내부/접합부 온도가 실제로 안정화되는 시간(통상 10~15분 이상) 이상이어야 합니다.
+"""
+
 
 # ============================================================
-# 계산 함수
+# 온도가속 / 온습도가속 / 열피로가속
 # ============================================================
 def celsius_to_kelvin(c):
     return c + 273.15
@@ -343,7 +331,7 @@ def equiv_time_single(t_field, af):
 
 
 def weibull_test_time_ratio(R, CL, n_sample, beta):
-    """시험시간비 = [ (-ln CL) / (n * -ln R) ] ^ (1/beta) """
+    """시험시간비 = [ (-ln CL) / (n * -ln R) ] ^ (1/beta)"""
     numer = -math.log(CL)
     denom = n_sample * (-math.log(R))
     return (numer / denom) ** (1.0 / beta)
@@ -369,10 +357,10 @@ def profile_cycle_time_min(low_dwell, ramp_up, high_dwell, ramp_down):
 
 
 # ============================================================
-# 수명데이터 분석 (Weibull MLE, 확률도표, 파생지표)
+# Weibull MLE (고장/미고장 혼합 데이터)
 # ============================================================
 def _safe_ratio_pow(t, eta, beta):
-    """ (t/eta)**beta 를 로그공간에서 계산해 오버플로우를 방지 """
+    """(t/eta)**beta 를 로그공간에서 계산해 오버플로우를 방지"""
     if t <= 0:
         return 0.0
     log_val = beta * (math.log(t) - math.log(eta))
@@ -399,7 +387,7 @@ def _weibull_negloglik(params, times, is_failure):
 
 
 def _nelder_mead(f, x0, max_iter=2000, tol=1e-10):
-    """scipy 없이 사용하는 간단한 2변수 Nelder-Mead 구현"""
+    """scipy 없이도 동작하는 2변수 Nelder-Mead 구현 (원본과 동일 알고리즘)"""
     n = len(x0)
     step = 0.5
     simplex = [list(x0)]
@@ -418,22 +406,27 @@ def _nelder_mead(f, x0, max_iter=2000, tol=1e-10):
         centroid = [sum(s[j] for s in simplex[:-1]) / n for j in range(n)]
         worst = simplex[-1]
         xr = [centroid[j] + 1.0 * (centroid[j] - worst[j]) for j in range(n)]
-        fr = f(xr)
-        if fr < fvals[0]:
+        fxr = f(xr)
+        if fxr < fvals[0]:
             xe = [centroid[j] + 2.0 * (centroid[j] - worst[j]) for j in range(n)]
-            fe = f(xe)
-            simplex[-1], fvals[-1] = (xe, fe) if fe < fr else (xr, fr)
-        elif fr < fvals[-2]:
-            simplex[-1], fvals[-1] = xr, fr
-        else:
-            xc = [centroid[j] + 0.5 * (worst[j] - centroid[j]) for j in range(n)]
-            fc = f(xc)
-            if fc < fvals[-1]:
-                simplex[-1], fvals[-1] = xc, fc
+            fxe = f(xe)
+            if fxe < fxr:
+                simplex[-1], fvals[-1] = xe, fxe
             else:
-                best_pt = simplex[0]
+                simplex[-1], fvals[-1] = xr, fxr
+        elif fxr < fvals[-2]:
+            simplex[-1], fvals[-1] = xr, fxr
+        else:
+            if fxr < fvals[-1]:
+                simplex[-1], fvals[-1] = xr, fxr
+            xc = [centroid[j] + 0.5 * (worst[j] - centroid[j]) for j in range(n)]
+            fxc = f(xc)
+            if fxc < fvals[-1]:
+                simplex[-1], fvals[-1] = xc, fxc
+            else:
+                best = simplex[0]
                 for i in range(1, len(simplex)):
-                    simplex[i] = [best_pt[j] + 0.5 * (simplex[i][j] - best_pt[j]) for j in range(n)]
+                    simplex[i] = [best[j] + 0.5 * (simplex[i][j] - best[j]) for j in range(n)]
                     fvals[i] = f(simplex[i])
     order = sorted(range(len(simplex)), key=lambda i: fvals[i])
     return simplex[order[0]], fvals[order[0]]
@@ -441,8 +434,7 @@ def _nelder_mead(f, x0, max_iter=2000, tol=1e-10):
 
 def fit_weibull_mle(times, is_failure):
     """중도절단(미고장) 데이터를 지원하는 Weibull MLE 적합.
-    반환: (beta, eta) 또는 데이터 부족 시 None
-    """
+    반환: (beta, eta) 또는 데이터 부족 시 None"""
     fail_times = [t for t, f in zip(times, is_failure) if f]
     if len(fail_times) < 2:
         return None
@@ -465,8 +457,7 @@ def weibull_median_rank(order, n):
 
 def weibull_rank_adjustment(times, is_failure):
     """미고장(중도절단) 데이터를 반영한 조정순위법(Johnson's Rank Adjustment).
-    반환: [(고장시간, median_rank), ...]  (고장 데이터만, 시간 오름차순)
-    """
+    반환: [(고장시간, median_rank), ...] (고장 데이터만, 시간 오름차순)"""
     order_data = sorted(zip(times, is_failure), key=lambda x: x[0])
     n = len(order_data)
     results = []
