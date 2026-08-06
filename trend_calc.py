@@ -1,17 +1,65 @@
+
 # -*- coding: utf-8 -*-
 """
-추세 분석기(Trend Analyzer) 계산 로직 모듈
-- CSV 자동헤더탐지 로더 / 노이즈필터 / 누적작동시간 / 추세적합(선형·지수) / TTF·RUL 판정
-원본 데스크톱 프로그램(app.py)의 계산 로직을 그대로 옮긴 것입니다.
+trend_calc.py
+원본 데스크톱 프로그램(내구시험 추세 분석기 v13, app.py/tkinter)의 계산 로직을
+웹(Streamlit) 환경에 맞게 옮긴 모듈.
+
+원본과 다른 부분(웹 환경 제약 때문에 반드시 바뀌는 것):
+- "폴더 선택" -> "여러 CSV 파일 업로드" (브라우저는 로컬 폴더를 실시간으로 감시할 수 없음)
+- 파일시스템 경로 대신 (파일명, bytes) 쌍을 다룸
+- 디스크 캐시(pickle) 대신 세션 캐시(st.session_state)를 사용 (app.py에서 처리)
+
+계산 로직(누적 작동시간 산출, 통계, 노이즈필터, 추세적합, TTF/RUL 판정 등)은
+원본과 동일한 알고리즘을 그대로 옮겼다.
 """
-import os, re, io
+import os
+import re
+import io
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
 
+FOCUS_ITEMS = ["Cmd1", "FB1", "Spd1", "Cur1", "Cmd2", "FB2", "Spd2", "Cur2",
+               "Cmd3", "FB3", "Spd3", "Cur3", "Pvtg"]
 DT = 0.1  # 1행당 초 (샘플링 간격)
 
+ACTIVE_RATIO_DEFAULT = 0.2  # 동작구간 판정 비율(전역 median 최대값 대비)
 
+
+# ============================== 노이즈/제외 ==============================
+def apply_noise_filter(series, mode, win=15):
+    s = pd.Series(series).astype(float)
+    if mode == "이동중앙값":
+        return s.rolling(win, center=True, min_periods=1).median().to_numpy()
+    if mode == "이동평균":
+        return s.rolling(win, center=True, min_periods=1).mean().to_numpy()
+    if mode == "3시그마제거":
+        m, sd = s.mean(), s.std()
+        if sd == 0 or np.isnan(sd):
+            return s.to_numpy()
+        mask = (s - m).abs() > 3 * sd
+        s2 = s.copy()
+        s2[mask] = np.nan
+        return s2.interpolate(limit_direction="both").to_numpy()
+    return s.to_numpy()
+
+
+def apply_exclude(y, lo, hi):
+    """제외 범위: lo~hi 사이 값을 NaN으로 만들어 화면에서 숨김(데이터 보존)."""
+    if lo is None and hi is None:
+        return y
+    y = np.asarray(y, dtype=float).copy()
+    lo2 = -np.inf if lo is None else lo
+    hi2 = np.inf if hi is None else hi
+    mask = (y >= lo2) & (y <= hi2)
+    y[mask] = np.nan
+    return y
+
+
+# ============================== 파일명/헤더 ==============================
 def parse_timestamp(fname):
     """파일명 패턴 '카운터-YYMMDD-HHMMSS.csv' 에서 실제 날짜/시각을 추출."""
     name = os.path.splitext(os.path.basename(fname))[0]
@@ -26,19 +74,14 @@ def parse_timestamp(fname):
     return None
 
 
-def _decode_raw_bytes(raw):
+def _decode_raw(raw_bytes):
     """인코딩 자동판별(utf-8-sig/cp949/euc-kr/utf-8)해서 텍스트로 반환."""
     for enc in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
         try:
-            return raw.decode(enc)
+            return raw_bytes.decode(enc)
         except Exception:
             continue
-    return raw.decode("utf-8", errors="ignore")
-
-
-def decode_raw(path):
-    raw = open(path, "rb").read()
-    return _decode_raw_bytes(raw)
+    return raw_bytes.decode("utf-8", errors="ignore")
 
 
 def _is_header_like(line):
@@ -50,6 +93,7 @@ def _is_header_like(line):
 
 
 def find_header_line(lines, expect_row=7):
+    """항목명(헤더) 줄의 인덱스를 찾는다. 8행(index=7)을 우선 확인 후 자동탐지로 보정."""
     if expect_row < len(lines) and _is_header_like(lines[expect_row]):
         return expect_row
     hdr = expect_row if expect_row < len(lines) else 0
@@ -59,9 +103,9 @@ def find_header_line(lines, expect_row=7):
     return hdr
 
 
-def get_header_items(text, expect_row=7):
-    """raw data 텍스트(파일 전체 문자열)의 헤더 줄을 읽어 항목(컬럼) 이름 목록을 반환."""
-    lines = text.splitlines()
+def get_header_items(raw_bytes, expect_row=7):
+    """raw data 파일의 헤더 줄(기본 8행)을 읽어 '항목(컬럼) 이름 목록'을 반환한다."""
+    lines = _decode_raw(raw_bytes).splitlines()
     if not lines:
         return []
     hdr = find_header_line(lines, expect_row=expect_row)
@@ -74,9 +118,10 @@ def get_header_items(text, expect_row=7):
     return cols
 
 
-def load_csv_text(text, usecols=None):
-    """헤더 줄 자동탐지 + footer 자동 제거. text는 파일 전체 문자열."""
-    lines = text.splitlines()
+def load_csv(raw_bytes, usecols=None):
+    """헤더 줄 자동탐지(8행 우선) + footer 자동 제거 + 인코딩 자동."""
+    txt = _decode_raw(raw_bytes)
+    lines = txt.splitlines()
     hdr = find_header_line(lines)
 
     def _read(engine):
@@ -87,7 +132,7 @@ def load_csv_text(text, usecols=None):
             keep = [c for c in usecols if c in header_cols]
             if keep:
                 kwargs["usecols"] = keep
-        return pd.read_csv(io.StringIO(text), **kwargs)
+        return pd.read_csv(io.StringIO(txt), **kwargs)
 
     try:
         df = _read("c")
@@ -95,8 +140,6 @@ def load_csv_text(text, usecols=None):
         df = _read("python")
 
     df.columns = [str(c).strip() for c in df.columns]
-    if len(df.columns) == 0:
-        return df
     first = df.columns[0]
     df = df[~df[first].astype(str).str.contains("Time", na=False, case=False)]
     for c in df.columns:
@@ -104,39 +147,13 @@ def load_csv_text(text, usecols=None):
     return df.dropna(how="all").reset_index(drop=True)
 
 
-def apply_noise_filter(series, mode, win=15):
-    s = pd.Series(series).astype(float)
-    if mode == "이동중앙값":
-        return s.rolling(win, center=True, min_periods=1).median().to_numpy()
-    if mode == "이동평균":
-        return s.rolling(win, center=True, min_periods=1).mean().to_numpy()
-    if mode == "3시그마제거":
-        m, sd = s.mean(), s.std()
-        if sd == 0 or np.isnan(sd):
-            return s.to_numpy()
-        mask = (s - m).abs() > 3 * sd
-        s2 = s.copy(); s2[mask] = np.nan
-        return s2.interpolate(limit_direction="both").to_numpy()
-    return s.to_numpy()
-
-
-def apply_exclude(y, lo, hi):
-    if lo is None and hi is None:
-        return y
-    y = np.asarray(y, dtype=float).copy()
-    lo2 = -np.inf if lo is None else lo
-    hi2 = np.inf if hi is None else hi
-    mask = (y >= lo2) & (y <= hi2)
-    y[mask] = np.nan
-    return y
-
-
-def summarize_file(text, focus_items):
-    """파일 1개(텍스트) -> 항목별 통계 dict, 실제 존재 컬럼 set, 행개수(=누적작동시간 계산용)."""
+# ============================== 요약 통계 ==============================
+def _summary_worker(args):
+    hr, raw_bytes, focus_items = args
     try:
-        df = load_csv_text(text, usecols=focus_items)
+        df = load_csv(raw_bytes, usecols=focus_items)
     except Exception:
-        return {}, set(), 0
+        return hr, {}, set(), 0
     cols_found = set(df.columns)
     nrows = len(df)
     rec = {}
@@ -146,23 +163,12 @@ def summarize_file(text, focus_items):
             if len(s) == 0:
                 continue
             m, sd = s.mean(), s.std()
-            rec[f"{it}_평균"] = m; rec[f"{it}_최대"] = s.max()
-            rec[f"{it}_최소"] = s.min(); rec[f"{it}_표준편차"] = sd
+            rec[f"{it}_평균"] = m
+            rec[f"{it}_최대"] = s.max()
+            rec[f"{it}_최소"] = s.min()
+            rec[f"{it}_표준편차"] = sd
             rec[f"{it}_이상"] = int(((s - m).abs() > 3 * sd).sum()) if sd and sd > 0 else 0
-    return rec, cols_found, nrows
-
-
-def cumulative_hours(nrows_list):
-    """파일별 행개수 리스트 -> (각 파일까지의) 누적 작동시간(h) 리스트. 1행=0.1초 기준."""
-    hours = []
-    acc = 0.0
-    for n in nrows_list:
-        acc += n * DT / 3600.0
-        hours.append(acc)
-    return hours
-
-
-ACTIVE_RATIO_DEFAULT = 0.2
+    return hr, rec, cols_found, nrows
 
 
 def _runs_above(mask):
@@ -195,34 +201,160 @@ def _active_median_peak(values, threshold):
     return med, peak_avg
 
 
-def _fit_linear(h, y):
+def _active_stats_worker(args):
+    hr, raw_bytes, items, threshold_map = args
+    try:
+        df = load_csv(raw_bytes, usecols=items)
+    except Exception:
+        return hr, {}
+    rec = {}
+    for it in items:
+        thr = threshold_map.get(it)
+        if it in df.columns and thr:
+            med, pk = _active_median_peak(df[it].to_numpy(), thr)
+            rec[f"{it}_동작구간 중앙값"] = med
+            rec[f"{it}_동작구간 피크평균"] = pk
+    return hr, rec
+
+
+def scan_files(uploaded):
+    """uploaded: [(filename, bytes), ...] -> 시간순 정렬 후 {seq: (filename, bytes)}"""
+    items = list(uploaded)
+
+    def sort_key(item):
+        fname, _ = item
+        ts = parse_timestamp(fname)
+        if ts is not None:
+            return (0, ts, fname)
+        return (1, fname)
+
+    items.sort(key=sort_key)
+    return {i: it for i, it in enumerate(items)}
+
+
+def build_summary(files, focus_items, active_ratio=ACTIVE_RATIO_DEFAULT, progress_cb=None):
+    """files: {seq: (filename, bytes)}
+    반환: summary(DataFrame), file_ranges({seq:(start_h,end_h)}), columns(list), active_thresholds(dict)
+    """
+    rows = {}
+    cols_found = set()
+    nrows_map = {}
+    to_compute = [(hr, raw, focus_items) for hr, (fname, raw) in files.items()]
+
+    total = len(files)
+    done = 0
+    if to_compute:
+        max_workers = min(16, (os.cpu_count() or 4) * 2)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_summary_worker, item): item for item in to_compute}
+            for fut in as_completed(futs):
+                hr, raw, _ = futs[fut]
+                try:
+                    hr2, rec, cols, nrows = fut.result()
+                except Exception:
+                    rec, cols, nrows = {}, set(), 0
+                rows[hr] = rec
+                cols_found |= cols
+                nrows_map[hr] = nrows
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total)
+
+    file_ranges = {}
+    cum = 0.0
+    for hr in sorted(files.keys()):
+        dur_h = nrows_map.get(hr, 0) * DT / 3600.0
+        start = cum
+        cum += dur_h
+        file_ranges[hr] = (start, cum)
+
+    summary = pd.DataFrame(rows).T.sort_index()
+    summary["누적작동시간(h)"] = [file_ranges.get(hr, (0, 0))[1] for hr in summary.index]
+    columns = [c for c in focus_items if c in cols_found]
+
+    # 신뢰성 분석용 동작구간 통계(Stage B)
+    threshold_map = {}
+    for it in columns:
+        col = f"{it}_최대"
+        if col in summary.columns:
+            mx = summary[col].abs()
+            mx = mx[np.isfinite(mx)]
+            if len(mx) > 0:
+                thr = float(np.median(mx)) * active_ratio
+                if thr > 0:
+                    threshold_map[it] = thr
+
+    rows2 = {}
+    to_compute2 = [(hr, files[hr][1], list(threshold_map.keys()), threshold_map)
+                   for hr in files.keys()] if threshold_map else []
+    if to_compute2:
+        max_workers = min(16, (os.cpu_count() or 4) * 2)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_active_stats_worker, item): item for item in to_compute2}
+            for fut in as_completed(futs):
+                hr, raw, _, _ = futs[fut]
+                try:
+                    hr2, rec2 = fut.result()
+                except Exception:
+                    rec2 = {}
+                rows2[hr] = rec2
+
+    if rows2:
+        df2 = pd.DataFrame(rows2).T
+        for c in df2.columns:
+            summary[c] = df2[c].reindex(summary.index)
+
+    return summary, file_ranges, columns, threshold_map
+
+
+def find_seq_by_cumhour(file_ranges, target_h):
+    """target_h(누적 작동시간)에 해당하는 파일 seq를 찾는다."""
+    if not file_ranges:
+        return None
+    items = sorted(file_ranges.items(), key=lambda kv: kv[1][0])
+    for seq, (s, e) in items:
+        if s - 1e-9 <= target_h <= e + 1e-9:
+            return seq, s, e
+    best = min(items, key=lambda kv: min(abs(kv[1][0] - target_h), abs(kv[1][1] - target_h)))
+    return best[0], best[1][0], best[1][1]
+
+
+# ============================== 추세 적합/예측 ==============================
+def fit_linear(h, y):
     a, b = np.polyfit(h, y, 1)
     pred = a * h + b
-    ss_res = np.sum((y - pred) ** 2); ss_tot = np.sum((y - np.mean(y)) ** 2)
+    ss_res = np.sum((y - pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return {"kind": "선형", "params": (a, b), "r2": r2, "f": lambda x, a=a, b=b: a * x + b}
+    return {"kind": "선형", "params": (a, b), "r2": r2,
+            "f": lambda x, a=a, b=b: a * x + b}
 
 
-def _fit_exp(h, y):
+def fit_exp(h, y):
+    """y = A * exp(B*h). y<=0 포함이면 적용 불가(None 반환)."""
     if np.any(y <= 0):
         return None
     logy = np.log(y)
     B, logA = np.polyfit(h, logy, 1)
     A = np.exp(logA)
     pred = A * np.exp(B * h)
-    ss_res = np.sum((y - pred) ** 2); ss_tot = np.sum((y - np.mean(y)) ** 2)
+    ss_res = np.sum((y - pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return {"kind": "지수", "params": (A, B), "r2": r2, "f": lambda x, A=A, B=B: A * np.exp(B * x)}
+    return {"kind": "지수", "params": (A, B), "r2": r2,
+            "f": lambda x, A=A, B=B: A * np.exp(B * x)}
 
 
 def best_model(h, y):
-    h = np.asarray(h, dtype=float); y = np.asarray(y, dtype=float)
+    """선형/지수 모델을 적합해 R²가 더 좋은 쪽을 채택."""
+    h = np.asarray(h, dtype=float)
+    y = np.asarray(y, dtype=float)
     ok = ~np.isnan(y)
     h, y = h[ok], y[ok]
     if len(h) < 2:
         return None
-    cands = [_fit_linear(h, y)]
-    exp_m = _fit_exp(h, y)
+    cands = [fit_linear(h, y)]
+    exp_m = fit_exp(h, y)
     if exp_m is not None:
         cands.append(exp_m)
     cands.sort(key=lambda m: m["r2"], reverse=True)
@@ -248,9 +380,10 @@ def predict_cross(model, h_now, limit):
 
 
 def detect_ttf(hours, ymax, ymin, lsl, usl, persist_ratio=0.7):
-    """스펙(LSL/USL) 최초 이탈 시점 + 영구/일시적 판정."""
+    """항목 1개에 대해 스펙(LSL/USL) 최초 이탈 시점을 찾고 영구/일시적 여부를 구분."""
     hours = np.asarray(hours, dtype=float)
-    ymax = np.asarray(ymax, dtype=float); ymin = np.asarray(ymin, dtype=float)
+    ymax = np.asarray(ymax, dtype=float)
+    ymin = np.asarray(ymin, dtype=float)
     breach = np.zeros(len(hours), dtype=bool)
     if usl is not None:
         breach |= (ymax > usl)
