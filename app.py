@@ -1,439 +1,867 @@
 # -*- coding: utf-8 -*-
 """
-통합 웹앱 : 신뢐성분석 + 추세 분석기 (Trend Analyzer)
-- 좌측 사이드바에서 사이트(신뢰성분석 / 추세분석기)를 전환합니다.
+app.py — 가속시험 통합계산기 (Streamlit 웹 버전)
+원본 tkinter 데스크톱 프로그램(신뢰성분석.py)의 레이아웃/버튼/문구를 그대로 재현:
+  탭① 온도가속(Arrhenius)
+  탭② 온습도가속(Arrhenius-Peck)
+  탭③ 열피로가속(Thermal Cycling) - Coffin-Manson / Modified Norris-Landzberg
+  탭④ Weibull 시험시간비 계산기 + 참고 DB
+  탭⑤ 수명데이터 분석 - 고장/미고장 데이터 -> Weibull MLE -> MTTF/B10/B1/R(t) + 확률도표
+각 탭 구조 : 좌측(입력) / 우측(결과, 연한 파란 배경 #eef2fb + 파란 글씨 #1a3fa0) 2단 배치
 """
 import io
 import math
-import os
-import glob as globmod
-import numpy as np
+
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
+import matplotlib
+matplotlib.rcParams['axes.unicode_minus'] = False
 
-import reliability_calc as R
-import trend_calc as T
+import reliability_calc as rc
 
-st.set_page_config(page_title="신뢐성분석 & 추세분석기", layout="wide")
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
-# ------------------------------------------------------------------
-# 사이드바 : 사이트 선택
-# ------------------------------------------------------------------
-st.sidebar.title("🧭 사이트 선택")
-site = st.sidebar.radio("이동", ["🔧 신뢐성 분석", "📈 추세 분석기"], label_visibility="collapsed")
 
-# ====================================================================
-# 🔧 신뢐성 분석
-# ====================================================================
-if site == "🔧 신뢐성 분석":
-    st.title("🔧 신뢐성 분석 (가속시험 통합계산기)")
-    tabs = st.tabs(["① 온도가속(Arrhenius)", "② 온습도가속(Peck)", "③ 열피로가속",
-                    "④ Weibull 시험시간비", "⑤ 수명데이터 분석"])
+st.set_page_config(page_title="가속시험 통합계산기", layout="wide")
 
-    # ---------------- ① 온도가속 ----------------
-    with tabs[0]:
-        st.subheader("① 온도가속 (Arrhenius)")
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            field_h = st.number_input("필드 목표시간(h)", value=87600.0, step=100.0, key="t1_field")
-            ea = st.number_input("활성화에너지 Ea(eV)", value=0.5, step=0.01, format="%.3f", key="t1_ea")
-            t_use = st.number_input("사용(필드) 온도(℃)", value=60.0, step=1.0, key="t1_use")
-            t_test = st.number_input("시험 온도(℃)", value=105.0, step=1.0, key="t1_test")
-            use_weibull = st.checkbox("Weibull 시험시간비 적용", key="t1_wb")
-            if use_weibull:
-                wc1, wc2, wc3, wc4 = st.columns(4)
-                R_target = wc1.number_input("목표신뢐도 R", value=0.99, step=0.01, format="%.3f", key="t1_R")
-                CL = wc2.number_input("신뢐수준 CL", value=0.5, step=0.05, format="%.3f", key="t1_CL")
-                n_sample = wc3.number_input("샘플수 n", value=6, step=1, key="t1_n")
-                beta = wc4.number_input("형상모수 β", value=2.0, step=0.1, key="t1_beta")
+# ---------------------------------------------------------------
+# 원본 tkinter 톤(파란 버튼 #2f6fed / 결과박스 #eef2fb, 글씨 #1a3fa0)을
+# 최대한 재현하기 위한 공통 CSS + 헬퍼
+# ---------------------------------------------------------------
+st.markdown("""
+<style>
+div.stButton > button[kind="primary"] {
+    background-color: #2f6fed; color: white; font-weight: 700;
+}
+.result-box {
+    background-color: #eef2fb; color: #1a3fa0; font-weight: 700;
+    font-size: 15px; padding: 14px 16px; border-radius: 6px;
+    white-space: pre-wrap; line-height: 1.55; min-height: 60px;
+}
+.detail-box {
+    color: #333; font-size: 13.5px; white-space: pre-wrap; line-height: 1.5;
+    padding: 6px 2px;
+}
+.warn-text { color: #a33; font-size: 13px; }
+</style>
+""", unsafe_allow_html=True)
 
-            with st.expander("Ea 참고 DB 검색"):
-                q = st.text_input("부품명 검색", key="t1_q")
-                rows = [r for r in R.EA_DB if q.lower() in r[0].lower()] if q else R.EA_DB
-                st.dataframe(pd.DataFrame(rows, columns=["부품", "Ea(eV)", "출처", "비고"]), height=250)
 
-        with c2:
-            if st.button("계산 실행", key="t1_run"):
-                af, test_h = R.arrhenius_test_time(field_h, ea, t_use, t_test)
-                ratio = None
-                if use_weibull:
-                    ratio = R.weibull_test_ratio(R_target, CL, int(n_sample), beta)
-                    test_h_final = test_h * ratio
-                else:
-                    test_h_final = test_h
-                st.metric("가속계수 AF", f"{af:,.4f}")
-                st.metric("등가시험시간(h)", f"{test_h:,.2f}")
-                if use_weibull:
-                    st.metric("Weibull 시험시간비", f"{ratio:,.4f}")
-                    st.metric("최종 시험시간(h) [보정 반영]", f"{test_h_final:,.2f}")
-                else:
-                    st.info("체크박스를 켜지 않으면 위 등가시험시간에는 R/CL 통계적 보장이 포함되어 있지 않습니다. "
-                            "목표 R/CL이 있다면 Weibull 시험시간비 적용을 켜주세요.")
+def result_box(text: str):
+    st.markdown(f'<div class="result-box">{text}</div>', unsafe_allow_html=True)
 
-    # ---------------- ② 온습도가속 ----------------
-    with tabs[1]:
-        st.subheader("② 온습도가속 (Arrhenius-Peck)")
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            field_h2 = st.number_input("필드 목표시간(h)", value=87600.0, step=100.0, key="t2_field")
-            ea2 = st.number_input("활성화에너지 Ea(eV)", value=0.5, step=0.01, format="%.3f", key="t2_ea")
-            n_exp = st.number_input("습도지수 n", value=2.7, step=0.1, key="t2_n")
-            t_use2 = st.number_input("사용(필드) 온도(℃)", value=60.0, step=1.0, key="t2_use_t")
-            t_test2 = st.number_input("시험 온도(℃)", value=85.0, step=1.0, key="t2_test_t")
-            rh_use = st.number_input("사용(필드) 습도(%RH)", value=60.0, step=1.0, key="t2_use_h")
-            rh_test = st.number_input("시험 습도(%RH)", value=85.0, step=1.0, key="t2_test_h")
-            use_weibull2 = st.checkbox("Weibull 시험시간비 적용", key="t2_wb")
-            if use_weibull2:
-                wc1, wc2, wc3, wc4 = st.columns(4)
-                R2_target = wc1.number_input("목표신뢐도 R", value=0.99, step=0.01, format="%.3f", key="t2_R")
-                CL2 = wc2.number_input("신뢐수준 CL", value=0.5, step=0.05, format="%.3f", key="t2_CL")
-                n2_sample = wc3.number_input("샘플수 n", value=6, step=1, key="t2_n_sample")
-                beta2 = wc4.number_input("형상모수 β", value=2.0, step=0.1, key="t2_beta")
-        with c2:
-            if st.button("계산 실행", key="t2_run"):
-                af_total, af_t, af_rh = R.peck_af(ea2, t_use2, t_test2, rh_use, rh_test, n_exp)
-                test_h2 = field_h2 / af_total
-                st.metric("온도항 AF", f"{af_t:,.4f}")
-                st.metric("습도항 AF", f"{af_rh:,.4f}")
-                st.metric("전체 가속계수 AF", f"{af_total:,.4f}")
-                st.metric("등가시험시간(h)", f"{test_h2:,.2f}")
-                if use_weibull2:
-                    ratio2 = R.weibull_test_ratio(R2_target, CL2, int(n2_sample), beta2)
-                    st.metric("Weibull 시험시간비", f"{ratio2:,.4f}")
-                    st.metric("최종 시험시간(h)", f"{test_h2*ratio2:,.2f}")
 
-    # ---------------- ③ 열피로가속 ----------------
-    with tabs[2]:
-        st.subheader("③ 열피로가속 (Coffin-Manson / Norris-Landzberg)")
-        model_kind = st.radio("모델 선택", ["Coffin-Manson", "Modified Norris-Landzberg"], horizontal=True, key="t3_model")
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            field_cycles = st.number_input("필드 목표 사이클수", value=10000.0, step=100.0, key="t3_field_c")
-            dt_field = st.number_input("필드 ΔT(℃)", value=40.0, step=1.0, key="t3_dtf")
-            dt_test = st.number_input("시험 ΔT(℃)", value=100.0, step=1.0, key="t3_dtt")
-            with st.expander("m지수 가이드 DB"):
-                st.dataframe(pd.DataFrame(R.M_GUIDE_DB, columns=["고장모드", "m지수", "적용대상"]), height=200)
-            m_exp = st.number_input("피로지수 m", value=2.65, step=0.05, key="t3_m")
-            if model_kind == "Modified Norris-Landzberg":
-                f_field = st.number_input("필드 사이클 주파수(cycle/day 등)", value=0.1, step=0.01, key="t3_ff")
-                f_test = st.number_input("시험 사이클 주파수", value=4.0, step=0.1, key="t3_ft")
-                t_field_max = st.number_input("필드 최대온도(℃)", value=80.0, step=1.0, key="t3_tfm")
-                t_test_max = st.number_input("시험 최대온도(℃)", value=125.0, step=1.0, key="t3_ttm")
-                ea3 = st.number_input("활성화에너지 Ea(eV)", value=0.12, step=0.01, format="%.3f", key="t3_ea")
-        with c2:
-            if st.button("계산 실행", key="t3_run"):
-                if model_kind == "Coffin-Manson":
-                    af3 = R.coffin_manson_af(dt_field, dt_test, m_exp)
-                else:
-                    af3 = R.norris_landzberg_af(dt_field, dt_test, f_field, f_test, t_field_max, t_test_max, m_exp, ea3)
-                req_cycles = R.thermal_cycling_required_cycles(field_cycles, af3)
-                st.metric("가속계수 AF", f"{af3:,.4f}")
-                st.metric("필요 시험 사이클수", f"{req_cycles:,.2f}")
-                if model_kind == "Coffin-Manson":
-                    st.caption("※ Coffin-Manson: ΔT 변화만 반영하는 단순 모델입니다.")
-                else:
-                    st.caption("※ Modified Norris-Landzberg: ΔT + 사이클 주파수 + 최대온도(Ea)까지 반영하는 확장 모델입니다.")
+def detail_box(text: str):
+    st.markdown(f'<div class="detail-box">{text}</div>', unsafe_allow_html=True)
 
-    # ---------------- ④ Weibull 시험시간비 ----------------
-    with tabs[3]:
-        st.subheader("④ Weibull 시험시간비 계산기")
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            R4 = st.number_input("목표신뢐도 R", value=st.session_state.get("beta_from_tab5_R", 0.99), step=0.01, format="%.3f", key="t4_R")
-            CL4 = st.number_input("신뢐수준 CL", value=0.5, step=0.05, format="%.3f", key="t4_CL")
-            n4 = st.number_input("샘플수 n", value=6, step=1, key="t4_n")
-            beta4_default = st.session_state.get("beta_from_tab5", 2.0)
-            beta4 = st.number_input("형상모수 β", value=float(beta4_default), step=0.1, format="%.4f", key="t4_beta")
-            if "beta_from_tab5" in st.session_state:
-                st.success(f"⑤탭에서 전달된 β={st.session_state['beta_from_tab5']:.4f} 가 기본값으로 반영되어 있습니다.")
-            with st.expander("β 참고 DB(고장모드별)"):
-                st.dataframe(pd.DataFrame(R.WEIBULL_DB, columns=["분류", "부품/고장모드", "β_min", "β_typ", "β_max",
-                                                                    "η_min", "η_typ", "η_max"]), height=250)
-        with c2:
-            if st.button("계산 실행", key="t4_run"):
-                ratio4 = R.weibull_test_ratio(R4, CL4, int(n4), beta4)
-                st.metric("시험시간비(ratio)", f"{ratio4:,.4f}")
-                st.caption("등가시험시간 × 이 비율 = 목표 R/CL을 통계적으로 담보하는 최종 시험시간")
 
-    # ---------------- ⑤ 수명데이터 분석 ----------------
-    with tabs[4]:
-        st.subheader("⑤ 수명데이터 분석 (Weibull MLE)")
-        st.caption("실제 고장/미고장(=시험·관찰 종료 시점까지 고장나지 않음) 데이터를 입력해 β·η을 추정합니다.")
+def df_to_excel_bytes(sheets: dict):
+    """{시트명: (헤더행 목록, 데이터행 목록)} -> xlsx bytes"""
+    output = io.BytesIO()
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    header_fill = PatternFill("solid", fgColor="DCE6F1")
+    bold = Font(bold=True)
+    for name, rows in sheets.items():
+        ws = wb.create_sheet(name[:31])
+        for i, row in enumerate(rows):
+            ws.append(row)
+            if i == 0:
+                for c in ws[1]:
+                    c.font = bold
+                    c.fill = header_fill
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = 20
+    wb.save(output)
+    return output.getvalue()
 
-        if "life_data" not in st.session_state:
-            st.session_state["life_data"] = pd.DataFrame({
-                "시간(h 또는 cycle)": [120.0, 340.0, 560.0, 800.0, 950.0, 1000.0, 1000.0, 1000.0],
-                "상태": ["고장", "고장", "고장", "고장", "고장", "미고장", "미고장", "미고장"],
-            })
 
-        st.markdown("**데이터 입력** (표를 직접 편집하거나 행을 추가/삭제하세요)")
-        edited = st.data_editor(
-            st.session_state["life_data"], num_rows="dynamic", key="life_editor",
-            column_config={
-                "상태": st.column_config.SelectboxColumn("상태", options=["고장", "미고장"]),
-            },
-        )
-        st.session_state["life_data"] = edited
-        st.caption("※ 미고장 = 관찰(시험) 종료 시점까지 고장이 발생하지 않은 데이터")
+st.title("가속시험 통합계산기")
 
-        colA, colB = st.columns([1, 2])
-        run5 = colA.button("Weibull 적합 실행", key="t5_run")
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    " ① 온도가속(Arrhenius) ",
+    " ② 온습도가속(Arrhenius-Peck) ",
+    " ③ 열피로가속(Thermal Cycling) ",
+    " ④ Weibull 시험시간비 ",
+    " ⑤ 수명데이터 분석 ",
+])
 
-        if run5 or "life_result" in st.session_state:
-            df = st.session_state["life_data"].dropna()
-            times = df["시간(h 또는 cycle)"].astype(float).tolist()
-            is_failure = (df["상태"] == "고장").tolist()
+# =================================================================
+# 공통 세션 상태 초기화
+# =================================================================
+def _init_state():
+    ss = st.session_state
+    ss.setdefault("t1_conditions", [])       # 탭① (Ta, t)
+    ss.setdefault("t2_conditions", [])       # 탭② (Ta, Ha, t)
+    ss.setdefault("t5_rows", [])             # 탭⑤ (time, is_failure)
+    ss.setdefault("t5_fit_result", None)     # (beta, eta)
+    ss.setdefault("t4_beta_override", None)  # ⑤->④ 연동값
+    ss.setdefault("goto_tab4_msg", None)
 
-            if run5:
-                if len(times) < 2 or sum(is_failure) < 2:
-                    st.warning("최소 2개 이상의 '고장' 데이터가 필요합니다.")
-                else:
-                    beta_hat, eta_hat, _ = R.weibull_mle(times, is_failure)
-                    st.session_state["life_result"] = (beta_hat, eta_hat, times, is_failure)
+_init_state()
 
-            if "life_result" in st.session_state:
-                beta_hat, eta_hat, times, is_failure = st.session_state["life_result"]
 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("형상모수 β", f"{beta_hat:.4f}")
-                m2.metric("척도모수 η", f"{eta_hat:,.2f}")
-                if beta_hat < 1:
-                    m3.info("β<1 : 초기고장(감소형) 경향")
-                elif beta_hat < 1.5:
-                    m3.info("β≈1 : 우발고장(일정) 경향")
-                else:
-                    m3.info("β>1 : 마모성고장(증가형) 경향")
+# =================================================================
+# 탭① 온도가속 (Arrhenius)
+# =================================================================
+with tab1:
+    left, right = st.columns([2, 3])
 
-                mttf = R.mttf_weibull(beta_hat, eta_hat)
-                b10 = R.b_life(beta_hat, eta_hat, 0.10)
-                b1 = R.b_life(beta_hat, eta_hat, 0.01)
+    with left:
+        st.markdown("##### ① 온도가속 (Arrhenius Model)")
+        st.markdown('<p class="warn-text">※ 사이클(열충격) 시험이 아닌, 단일 온도 유지 시험(정특성)에 적용합니다.</p>',
+                    unsafe_allow_html=True)
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("MTTF(평균수명)", f"{mttf:,.2f}")
-                c2.metric("B10 수명", f"{b10:,.2f}")
-                c3.metric("B1 수명", f"{b1:,.2f}")
+        with st.container(border=True):
+            st.markdown("**입력값**")
+            c1, c2 = st.columns([3, 1])
+            e_val = c1.number_input("활성화에너지 E (eV)", value=0.8, step=0.01, format="%.4f", key="t1_e")
+            with c2:
+                st.write("")
+                st.write("")
+                with st.popover("DB에서 찾기"):
+                    key = st.text_input("부품명 검색:", key="t1_db_search")
+                    rows = [r for r in rc.EA_DB if key.strip().lower() in r[0].lower()] if key.strip() else rc.EA_DB
+                    df = pd.DataFrame(rows, columns=["부품", "활성화에너지(eV)", "출처", "비고"])
+                    st.dataframe(df, height=260, use_container_width=True)
+                    st.caption("※ 활성화에너지가 단일 숫자값(범위 아님)인 행만 적용됩니다.")
+                    sel_label = st.selectbox("적용할 항목 선택", options=list(range(len(df))),
+                                              format_func=lambda i: f"{df.iloc[i]['부품']} ({df.iloc[i]['활성화에너지(eV)']})",
+                                              key="t1_db_select") if len(df) else None
+                    if st.button("선택값 적용", key="t1_db_apply") and sel_label is not None:
+                        ev_text = str(df.iloc[sel_label]["활성화에너지(eV)"]).split("~")[0].split("-")[0].replace("eV", "").strip()
+                        try:
+                            st.session_state["t1_e"] = float(ev_text)
+                            st.rerun()
+                        except ValueError:
+                            st.warning("이 항목은 단일 숫자값이 아니라 자동입력이 어렵습니다. 직접 입력해주세요.")
+            tref = st.number_input("대표(목표) 온도 Tref (℃)", value=125.0, step=1.0, key="t1_tref")
 
-                with st.expander("ℹ️ MTTF / B10 / B1 이 왜 필요한가요?"):
-                    st.markdown(
-                        "- **β, η만으로는 실무적으로 감이 오지 않기 때문에**, 대표 수명값으로 변환해서 보는 지표입니다.\n"
-                        "- **MTTF(평균수명)**: 평균적으로 몇 시간/사이클에서 고장나는지 (전체 경향 파악용)\n"
-                        "- **B10 수명**: 10%가 고장나는 시점. **자동차/부품 업계에서 가장 널리 쓰는 판정기준**입니다.\n"
-                        "  (예: \"B10 수명이 목표 필드수명보다 짧다\" → 설계 변경 필요)\n"
-                        "- **B1 수명**: 1%가 고장나는 시점. 초기불량률에 더 민감한 기준이 필요할 때 사용합니다."
-                    )
+        with st.container(border=True):
+            st.markdown("**시험 조건 (온도 / 시간) 추가**")
+            cc1, cc2, cc3 = st.columns([1, 1, 1])
+            ta_in = cc1.number_input("조건온도(℃)", value=100.0, step=1.0, key="t1_ta_in")
+            time_in = cc2.number_input("조건시간(h)", value=200.0, step=1.0, key="t1_time_in")
+            with cc3:
+                st.write("")
+                if st.button("추가 +", key="t1_add"):
+                    st.session_state.t1_conditions.append((ta_in, time_in))
 
-                st.markdown("**임의 시점 신뢐도 계산**")
-                t_input = st.number_input("확인할 시점 t (h 또는 cycle)", value=float(round(mttf/2, 1)), key="t5_t")
-                Rt = R.reliability_at(beta_hat, eta_hat, t_input)
-                Ft = R.cdf_at(beta_hat, eta_hat, t_input)
-                ht = R.hazard_at(beta_hat, eta_hat, t_input)
-                rc1, rc2, rc3 = st.columns(3)
-                rc1.metric(f"R({t_input:g}) 신뢐도", f"{Rt*100:,.2f}%")
-                rc2.metric(f"F({t_input:g}) 누적고장률", f"{Ft*100:,.2f}%")
-                rc3.metric(f"h({t_input:g}) 고장률", f"{ht:.6f}")
-
-                with st.expander("ℹ️ 임의 시점 신뢐도 계산은 왜 하는 건가요?"):
-                    st.markdown(
-                        "- 이 계산은 **관찰(시험)한 기간과 무관하게, 알고 싶은 임의의 시점(t)에서의 신뢐도를 역산**하는 기능입니다.\n"
-                        "- 예: 시험은 1000시간까지 진행했더라도, t=200을 입력하면 **'200시간을 버틸 확률'**을 계산해줍니다.\n"
-                        "- t=필드 목표수명(예: 10년=87,600h)을 넣으면 **'이 모델대로면 필드수명 시점 생존율이 얼마인지'** 사전 예측에 활용합니다.\n"
-                        "- ⚠️ **주의**: t가 관찰된 데이터 범위를 훨씬 벗어나면(외삽), 예측 오차가 커질 수 있습니다. "
-                        "가능하면 관찰범위 안의 값을 우선 확인하세요."
-                    )
-
-                # Weibull 확률도표
-                rows = R.johnson_rank_adjustment(times, is_failure)
-                if len(rows) >= 2:
-                    fig, ax = plt.subplots(figsize=(6, 4.5))
-                    xs = [math.log(r[0]) for r in rows]
-                    ys = [math.log(-math.log(1 - r[2])) for r in rows]
-                    ax.scatter(xs, ys, label="데이터(고장)")
-                    xs_line = np.linspace(min(xs) - 0.5, max(xs) + 0.5, 50)
-                    ys_line = beta_hat * (xs_line - math.log(eta_hat))
-                    ax.plot(xs_line, ys_line, color="red", label="MLE 적합선")
-                    ax.set_xlabel("ln(t)")
-                    ax.set_ylabel("ln(-ln(1-F))")
-                    ax.set_title("Weibull Probability Plot")
-                    ax.legend()
-                    ax.grid(alpha=0.3)
-                    st.pyplot(fig)
-                else:
-                    st.info("확률도표를 그리려면 고장 데이터가 2개 이상 필요합니다.")
-
-                if st.button("이 β값을 ④ Weibull 탭으로 보내기", key="t5_send"):
-                    st.session_state["beta_from_tab5"] = beta_hat
-                    st.success(f"β={beta_hat:.4f} 가 ④탭 기본값으로 반영되었습니다. 상단 ④ 탭에서 확인하세요.")
-
-                # 엑셀 내보내기
-                buf = io.BytesIO()
-                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    st.session_state["life_data"].to_excel(writer, sheet_name="입력데이터", index=False)
-                    pd.DataFrame({
-                        "항목": ["β", "η", "MTTF", "B10", "B1"],
-                        "값": [beta_hat, eta_hat, mttf, b10, b1],
-                    }).to_excel(writer, sheet_name="결과", index=False)
-                st.download_button("엑셀로 내보내기", data=buf.getvalue(),
-                                    file_name="수명데이터분석_결과.xlsx", key="t5_dl")
-
-# ====================================================================
-# 📈 추세 분석기
-# ====================================================================
-else:
-    st.title("📈 추세 분석기 (Trend Analyzer)")
-    tabs = st.tabs(["전체추세", "정밀분석", "두 시간대 비교", "신뢐성분석(TTF·RUL)"])
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("데이터 불러오기")
-    mode = st.sidebar.radio("방식", ["폴더 경로 입력(로컬 실행 시)", "파일 업로드"], key="tr_mode")
-
-    files_info = []  # (파일명, text)
-    if mode == "폴더 경로 입력(로컬 실행 시)":
-        folder = st.sidebar.text_input("CSV 폴더 경로", key="tr_folder")
-        if folder and os.path.isdir(folder):
-            paths = sorted(globmod.glob(os.path.join(folder, "*.csv")))
-            for p in paths:
-                try:
-                    files_info.append((os.path.basename(p), T.decode_raw(p)))
-                except Exception:
-                    pass
-    else:
-        uploaded = st.sidebar.file_uploader("CSV 파일 업로드(여러개 가능)", type=["csv"], accept_multiple_files=True, key="tr_upload")
-        if uploaded:
-            for uf in uploaded:
-                raw = uf.read()
-                files_info.append((uf.name, T._decode_raw_bytes(raw)))
-
-    if not files_info:
-        st.info("좌측에서 폴더 경로를 입력하거나 CSV 파일을 업로드하세요.")
-        st.stop()
-
-    # 파일명 내 타임스탬프로 정렬(가능하면), 아니면 이름 정렬
-    def sort_key(item):
-        name, _ = item
-        ts = T.parse_timestamp(name)
-        return (0, ts) if ts else (1, name)
-
-    files_info.sort(key=sort_key)
-    st.sidebar.success(f"{len(files_info)}개 파일 로드됨")
-
-    # 헤더(항목) 추출
-    items_all = T.get_header_items(files_info[0][1])
-    focus_items = st.sidebar.multiselect("분석할 항목 선택", items_all, default=items_all[: min(6, len(items_all))])
-
-    if st.sidebar.button("전체 스캔 실행", key="tr_scan"):
-        recs = []
-        nrows_list = []
-        for name, text in files_info:
-            rec, cols, nrows = T.summarize_file(text, focus_items)
-            rec["파일명"] = name
-            recs.append(rec)
-            nrows_list.append(nrows)
-        df_summary = pd.DataFrame(recs)
-        hours = T.cumulative_hours(nrows_list)
-        df_summary["누적작동시간(h)"] = hours
-        st.session_state["tr_summary"] = df_summary
-        st.session_state["tr_files_info"] = files_info
-        st.session_state["tr_focus_items"] = focus_items
-        st.success("스캔 완료")
-
-    if "tr_summary" not in st.session_state:
-        st.info("좌측 '전체 스캔 실행' 버튼을 눌러주세요.")
-        st.stop()
-
-    df_summary = st.session_state["tr_summary"]
-
-    # ---------------- 전체추세 ----------------
-    with tabs[0]:
-        st.subheader("전체 추세")
-        item_sel = st.selectbox("항목 선택", st.session_state["tr_focus_items"], key="tr_t1_item")
-        stat_sel = st.selectbox("통계량", ["평균", "최대", "최소", "표준편차"], key="tr_t1_stat")
-        col = f"{item_sel}_{stat_sel}"
-        if col in df_summary.columns:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_summary["누적작동시간(h)"], y=df_summary[col], mode="lines+markers", name=col))
-            fig.update_layout(xaxis_title="누적작동시간(h)", yaxis_title=col, height=500)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(df_summary[["파일명", "누적작동시간(h)", col]])
-        else:
-            st.warning("해당 항목/통계 조합의 데이터가 없습니다.")
-
-    # ---------------- 정밀분석 ----------------
-    with tabs[1]:
-        st.subheader("정밀분석 (개별 파일 원본 파형)")
-        fname_sel = st.selectbox("파일 선택", [n for n, _ in st.session_state["tr_files_info"]], key="tr_t2_file")
-        noise_mode = st.selectbox("노이즈 필터", ["없음", "이동중앙값", "이동평균", "3시그마제거"], key="tr_t2_noise")
-        items_sel2 = st.multiselect("겹쳐볼 항목(다중선택 가능)", st.session_state["tr_focus_items"],
-                                     default=st.session_state["tr_focus_items"][:1], key="tr_t2_items")
-        text2 = dict(st.session_state["tr_files_info"])[fname_sel]
-        df2 = T.load_csv_text(text2, usecols=items_sel2)
-        fig2 = go.Figure()
-        for it in items_sel2:
-            if it in df2.columns:
-                y = df2[it].to_numpy()
-                if noise_mode != "없음":
-                    y = T.apply_noise_filter(y, noise_mode)
-                x = np.arange(len(y)) * T.DT
-                fig2.add_trace(go.Scatter(x=x, y=y, mode="lines", name=it))
-        fig2.update_layout(xaxis_title="시간(초)", height=550)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # ---------------- 두 시간대 비교 ----------------
-    with tabs[2]:
-        st.subheader("두 시간대 비교")
-        names_all = [n for n, _ in st.session_state["tr_files_info"]]
-        cA, cB = st.columns(2)
-        f1 = cA.selectbox("비교 파일 1(초기)", names_all, index=0, key="tr_t3_f1")
-        f2 = cB.selectbox("비교 파일 2(후기)", names_all, index=len(names_all)-1, key="tr_t3_f2")
-        item3 = st.selectbox("비교 항목", st.session_state["tr_focus_items"], key="tr_t3_item")
-        d = dict(st.session_state["tr_files_info"])
-        df_f1 = T.load_csv_text(d[f1], usecols=[item3])
-        df_f2 = T.load_csv_text(d[f2], usecols=[item3])
-        fig3 = go.Figure()
-        if item3 in df_f1.columns:
-            fig3.add_trace(go.Scatter(x=np.arange(len(df_f1))*T.DT, y=df_f1[item3], mode="lines", name=f"{f1}(초기)"))
-        if item3 in df_f2.columns:
-            fig3.add_trace(go.Scatter(x=np.arange(len(df_f2))*T.DT, y=df_f2[item3], mode="lines", name=f"{f2}(후기)"))
-        fig3.update_layout(xaxis_title="시간(초)", height=550)
-        st.plotly_chart(fig3, use_container_width=True)
-
-    # ---------------- 신뢐성분석(TTF·RUL) ----------------
-    with tabs[3]:
-        st.subheader("신뢐성분석 - TTF(고장시점) / RUL(잔존수명) 예측")
-        item4 = st.selectbox("판정 항목", st.session_state["tr_focus_items"], key="tr_t4_item")
-        c1, c2 = st.columns(2)
-        use_lsl = c1.checkbox("LSL(하한) 설정", key="tr_t4_uselsl")
-        lsl = c1.number_input("LSL 값", value=0.0, key="tr_t4_lsl") if use_lsl else None
-        use_usl = c2.checkbox("USL(상한) 설정", key="tr_t4_useusl")
-        usl = c2.number_input("USL 값", value=100.0, key="tr_t4_usl") if use_usl else None
-
-        col_max = f"{item4}_최대"
-        col_min = f"{item4}_최소"
-        if col_max in df_summary.columns and col_min in df_summary.columns:
-            hours = df_summary["누적작동시간(h)"].to_numpy()
-            ymax = df_summary[col_max].to_numpy()
-            ymin = df_summary[col_min].to_numpy()
-
-            ttf = T.detect_ttf(hours, ymax, ymin, lsl, usl)
-            if ttf:
-                st.error(f"⚠ 스펙 이탈 감지: {ttf['h']:.2f}h 시점, 값={ttf['value']:.3f}, 판정={ttf['kind']} "
-                         f"(이후 지속비율 {ttf['persist']*100:.1f}%)")
+            st.markdown("**조건 목록**")
+            if st.session_state.t1_conditions:
+                cond_df = pd.DataFrame(st.session_state.t1_conditions, columns=["조건온도(℃)", "조건시간(h)"])
+                st.dataframe(cond_df, use_container_width=True, height=180)
             else:
-                st.success("스펙 이탈이 감지되지 않았습니다.")
+                cond_df = pd.DataFrame(columns=["조건온도(℃)", "조건시간(h)"])
+                st.caption("추가된 조건이 없습니다.")
 
-            col_mean = f"{item4}_평균"
-            if col_mean in df_summary.columns:
-                model = T.best_model(hours, df_summary[col_mean].to_numpy())
-                if model:
-                    st.info(f"추세모델: {model['kind']} (R²={model['r2']:.4f})")
-                    cross_u = T.predict_cross(model, hours[-1], usl) if usl is not None else None
-                    cross_l = T.predict_cross(model, hours[-1], lsl) if lsl is not None else None
-                    if cross_u:
-                        st.metric("USL 도달 예상시점(h) [RUL 참고]", f"{cross_u:,.2f}")
-                    if cross_l:
-                        st.metric("LSL 도달 예상시점(h) [RUL 참고]", f"{cross_l:,.2f}")
-                    if not cross_u and not cross_l:
-                        st.caption("현재 추세로는 관찰기간의 5배 이내에 스펙 이탈이 예상되지 않습니다.")
+            bd1, bd2 = st.columns(2)
+            del_idx = bd1.number_input("삭제할 행 번호(0부터)", min_value=0, value=0, step=1, key="t1_del_idx",
+                                        disabled=not st.session_state.t1_conditions)
+            if bd1.button("선택 삭제 🗑", key="t1_del_sel", disabled=not st.session_state.t1_conditions):
+                if 0 <= int(del_idx) < len(st.session_state.t1_conditions):
+                    st.session_state.t1_conditions.pop(int(del_idx))
+                    st.rerun()
+            if bd2.button("전체 삭제", key="t1_del_all", disabled=not st.session_state.t1_conditions):
+                st.session_state.t1_conditions = []
+                st.rerun()
+
+        with st.container(border=True):
+            st.markdown("**Weibull 시험시간비 적용 (선택)**")
+            wb_apply = st.checkbox("적용", key="t1_wb_apply")
+            w1, w2, w3, w4 = st.columns(4)
+            r_var = w1.number_input("목표신뢰도 R", value=0.99, format="%.4f", key="t1_r")
+            cl_var = w2.number_input("신뢰수준 CL", value=0.5, format="%.4f", key="t1_cl")
+            n_var = w3.number_input("샘플수 n", value=6.0, step=1.0, key="t1_n")
+            beta_var = w4.number_input("형상모수 β", value=2.0, step=0.1, key="t1_beta")
+
+        b1, b2 = st.columns(2)
+        calc_clicked = b1.button("계산 실행 ▶", type="primary", use_container_width=True, key="t1_calc")
+
+        if calc_clicked:
+            if not st.session_state.t1_conditions:
+                st.warning("조건을 1개 이상 추가해주세요.")
+            else:
+                last_rows = []
+                total = 0.0
+                for ta, t in st.session_state.t1_conditions:
+                    af = rc.arrhenius_af(tref, ta, e_val)
+                    eq = t * af
+                    total += eq
+                    last_rows.append((ta, t, af, eq))
+                final_time = total
+                ratio = None
+                if wb_apply:
+                    try:
+                        ratio = rc.weibull_test_time_ratio(r_var, cl_var, n_var, beta_var)
+                        final_time = total * ratio
+                    except (ValueError, ZeroDivisionError):
+                        st.warning("Weibull 파라미터를 확인해주세요.")
+                st.session_state["t1_last"] = dict(rows=last_rows, total=total, ratio=ratio,
+                                                    final=final_time, tref=tref, e=e_val)
+
+        with right:
+            st.markdown("##### 결과")
+            last = st.session_state.get("t1_last")
+            if last:
+                lines = [f"총 등가시험시간(@{last['tref']:.1f}℃) = {last['total']:,.2f} h  ({last['total']/24:,.2f} 일)"]
+                if last["ratio"] is not None:
+                    lines.append(f"Weibull 시험시간비 = {last['ratio']:.4f}")
+                    lines.append(f"최종 가속시험시간 = {last['final']:,.2f} h  ({last['final']/24:,.2f} 일)")
+                result_box("\n".join(lines))
+            else:
+                result_box("조건을 입력하고 [계산 실행]을 눌러주세요.")
+
+            with st.expander("계산 공식 (Arrhenius Model)", expanded=True):
+                st.text(
+                    "AF = exp[ (E / k) x (1/Tu - 1/Ta) ]\n\n"
+                    "여기서  AF : 가속계수\n"
+                    "        E  : 활성화에너지 (eV)\n"
+                    "        k  : Boltzmann 상수 (8.6173e-05 eV/K)\n"
+                    "        Tu : 사용(필드) 온도 (K)\n"
+                    "        Ta : 가속(시험) 온도 (K)\n\n"
+                    "등가시험시간 = 조건시간 / AF  (조건온도 -> Tref 로 환산)\n"
+                    "최종 가속시험시간 = 등가시험시간 합계 x Weibull 시험시간비"
+                )
+
+            if last:
+                detail = ["[조건별 상세]"]
+                for ta, t, af, eq in last["rows"]:
+                    detail.append(f"  {ta:.1f}℃ / {t:.1f}h  ->  AF={af:,.3f}   등가시간={eq:,.2f}h")
+                detail_box("\n".join(detail))
+
+            if last and HAS_OPENPYXL:
+                sheets = {
+                    "온도가속(Arrhenius)": [
+                        ["활성화에너지 E(eV)", last["e"], "대표(목표)온도 Tref(℃)", last["tref"]],
+                        ["조건온도(℃)", "조건시간(h)", "가속계수 AF", "등가시간(h)"],
+                        *[[ta, t, af, eq] for ta, t, af, eq in last["rows"]],
+                    ]
+                }
+                sheets["온도가속(Arrhenius)"].append(["총 등가시험시간(h)", last["total"]])
+                if last["ratio"] is not None:
+                    sheets["온도가속(Arrhenius)"].append(["Weibull 시험시간비", last["ratio"]])
+                    sheets["온도가속(Arrhenius)"].append(["최종 가속시험시간(h)", last["final"]])
+                b2.download_button("엑셀로 내보내기 📊", df_to_excel_bytes(sheets),
+                                    file_name="온도가속_계산결과.xlsx", use_container_width=True, key="t1_dl")
+            else:
+                b2.button("엑셀로 내보내기 📊", disabled=True, use_container_width=True, key="t1_dl_disabled")
+
+
+# =================================================================
+# 탭② 온습도가속 (Arrhenius-Peck)
+# =================================================================
+with tab2:
+    left, right = st.columns([2, 3])
+
+    with left:
+        st.markdown("##### ② 온습도가속 (Arrhenius-Peck Model)")
+
+        with st.container(border=True):
+            st.markdown("**입력값**")
+            c1, c2, c3 = st.columns([2, 1, 2])
+            e_val2 = c1.number_input("활성화에너지 E (eV)", value=0.79, step=0.01, format="%.4f", key="t2_e")
+            with c2:
+                st.write("")
+                st.write("")
+                with st.popover("DB"):
+                    key = st.text_input("부품명 검색:", key="t2_db_search")
+                    rows = [r for r in rc.EA_DB if key.strip().lower() in r[0].lower()] if key.strip() else rc.EA_DB
+                    df = pd.DataFrame(rows, columns=["부품", "활성화에너지(eV)", "출처", "비고"])
+                    st.dataframe(df, height=260, use_container_width=True)
+                    sel = st.selectbox("적용할 항목 선택", options=list(range(len(df))),
+                                        format_func=lambda i: f"{df.iloc[i]['부품']} ({df.iloc[i]['활성화에너지(eV)']})",
+                                        key="t2_db_select") if len(df) else None
+                    if st.button("선택값 적용", key="t2_db_apply") and sel is not None:
+                        ev_text = str(df.iloc[sel]["활성화에너지(eV)"]).split("~")[0].split("-")[0].replace("eV", "").strip()
+                        try:
+                            st.session_state["t2_e"] = float(ev_text)
+                            st.rerun()
+                        except ValueError:
+                            st.warning("이 항목은 단일 숫자값이 아니라 자동입력이 어렵습니다. 직접 입력해주세요.")
+            n_val = c3.number_input("습도항 지수 n", value=2.66, step=0.01, key="t2_n")
+
+            d1, d2 = st.columns(2)
+            tu_val = d1.number_input("사용(필드) 온도 Tu(℃)", value=23.0, step=1.0, key="t2_tu")
+            hu_val = d2.number_input("사용(필드) 습도 Hu(%RH)", value=65.0, step=1.0, key="t2_hu")
+
+        with st.container(border=True):
+            st.markdown("**가속시험 조건 (온도 / 습도 / 시간) 추가**")
+            cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
+            ta_in = cc1.number_input("가속온도(℃)", value=85.0, step=1.0, key="t2_ta_in")
+            ha_in = cc2.number_input("가속습도(%RH)", value=85.0, step=1.0, key="t2_ha_in")
+            t_in = cc3.number_input("시간(h)", value=303.0, step=1.0, key="t2_t_in")
+            with cc4:
+                st.write("")
+                if st.button("추가 +", key="t2_add"):
+                    st.session_state.t2_conditions.append((ta_in, ha_in, t_in))
+
+            st.markdown("**조건 목록**")
+            if st.session_state.t2_conditions:
+                cond_df = pd.DataFrame(st.session_state.t2_conditions,
+                                        columns=["가속온도(℃)", "가속습도(%RH)", "시간(h)"])
+                st.dataframe(cond_df, use_container_width=True, height=180)
+            else:
+                st.caption("추가된 조건이 없습니다.")
+
+            bd1, bd2 = st.columns(2)
+            del_idx2 = bd1.number_input("삭제할 행 번호(0부터)", min_value=0, value=0, step=1, key="t2_del_idx",
+                                         disabled=not st.session_state.t2_conditions)
+            if bd1.button("선택 삭제 🗑", key="t2_del_sel", disabled=not st.session_state.t2_conditions):
+                if 0 <= int(del_idx2) < len(st.session_state.t2_conditions):
+                    st.session_state.t2_conditions.pop(int(del_idx2))
+                    st.rerun()
+            if bd2.button("전체 삭제", key="t2_del_all", disabled=not st.session_state.t2_conditions):
+                st.session_state.t2_conditions = []
+                st.rerun()
+
+        with st.container(border=True):
+            st.markdown("**Weibull 시험시간비 적용 (선택)**")
+            wb_apply2 = st.checkbox("적용", key="t2_wb_apply")
+            w1, w2, w3, w4 = st.columns(4)
+            r_var2 = w1.number_input("목표신뢰도 R", value=0.99, format="%.4f", key="t2_r")
+            cl_var2 = w2.number_input("신뢰수준 CL", value=0.5, format="%.4f", key="t2_cl")
+            n_var2 = w3.number_input("샘플수 n", value=6.0, step=1.0, key="t2_ns")
+            beta_var2 = w4.number_input("형상모수 β", value=2.0, step=0.1, key="t2_beta")
+
+        b1, b2 = st.columns(2)
+        calc_clicked2 = b1.button("계산 실행 ▶", type="primary", use_container_width=True, key="t2_calc")
+
+        if calc_clicked2:
+            if not st.session_state.t2_conditions:
+                st.warning("조건을 1개 이상 추가해주세요.")
+            else:
+                last_rows = []
+                total = 0.0
+                for ta, ha, t in st.session_state.t2_conditions:
+                    af = rc.peck_af(tu_val, hu_val, ta, ha, e_val2, n_val)
+                    eq = t * af
+                    total += eq
+                    last_rows.append((ta, ha, t, af, eq))
+                final_time = total
+                ratio = None
+                if wb_apply2:
+                    try:
+                        ratio = rc.weibull_test_time_ratio(r_var2, cl_var2, n_var2, beta_var2)
+                        final_time = total * ratio
+                    except (ValueError, ZeroDivisionError):
+                        st.warning("Weibull 파라미터를 확인해주세요.")
+                st.session_state["t2_last"] = dict(rows=last_rows, total=total, ratio=ratio, final=final_time,
+                                                    tu=tu_val, hu=hu_val, e=e_val2, n=n_val)
+
+        with right:
+            st.markdown("##### 결과")
+            last = st.session_state.get("t2_last")
+            if last:
+                lines = [f"총 등가시험시간(@{last['tu']:.1f}℃/{last['hu']:.1f}%RH 기준) = "
+                         f"{last['total']:,.2f} h  ({last['total']/24:,.2f} 일)"]
+                if last["ratio"] is not None:
+                    lines.append(f"Weibull 시험시간비 = {last['ratio']:.4f}")
+                    lines.append(f"최종 가속시험시간 = {last['final']:,.2f} h  ({last['final']/24:,.2f} 일)")
+                result_box("\n".join(lines))
+            else:
+                result_box("조건을 입력하고 [계산 실행]을 눌러주세요.")
+
+            with st.expander("계산 공식 (Arrhenius-Peck Model)", expanded=True):
+                st.text(
+                    "AF = Lu/La = exp[(E/k) x (1/Tu - 1/Ta)] x (Hu/Ha)^(-n)\n\n"
+                    "여기서  AF : 가속계수(Acceleration Factor)\n"
+                    "        L  : 제품의 수명(h)\n"
+                    "        E  : 활성화 에너지(Activation Energy), eV\n"
+                    "        k  : Boltzmann 상수(=8.6173e-05 eV/K)\n"
+                    "        T  : 절대 온도(K)\n"
+                    "        H  : 상대 습도(% RH)\n"
+                    "        n  : 습도항 지수\n"
+                    "        첨자 a : 가속조건 / 첨자 u : 비가속조건 또는 사용자 환경조건\n\n"
+                    "등가시험시간 = 조건시간 / AF\n"
+                    "최종 가속시험시간 = 등가시험시간 합계 x Weibull 시험시간비"
+                )
+
+            if last:
+                detail = ["[조건별 상세]"]
+                for ta, ha, t, af, eq in last["rows"]:
+                    detail.append(f"  {ta:.1f}℃/{ha:.1f}%RH / {t:.1f}h  ->  AF={af:,.2f}   등가시간={eq:,.2f}h")
+                detail_box("\n".join(detail))
+
+            if last and HAS_OPENPYXL:
+                sheets = {
+                    "온습도가속(Peck)": [
+                        ["E(eV)", last["e"], "n", last["n"], "Tu(℃)", last["tu"], "Hu(%RH)", last["hu"]],
+                        ["가속온도(℃)", "가속습도(%RH)", "시간(h)", "AF", "등가시간(h)"],
+                        *[[ta, ha, t, af, eq] for ta, ha, t, af, eq in last["rows"]],
+                    ]
+                }
+                sheets["온습도가속(Peck)"].append(["총 등가시험시간(h)", last["total"]])
+                if last["ratio"] is not None:
+                    sheets["온습도가속(Peck)"].append(["Weibull 시험시간비", last["ratio"]])
+                    sheets["온습도가속(Peck)"].append(["최종 가속시험시간(h)", last["final"]])
+                b2.download_button("엑셀로 내보내기 📊", df_to_excel_bytes(sheets),
+                                    file_name="온습도가속_계산결과.xlsx", use_container_width=True, key="t2_dl")
+            else:
+                b2.button("엑셀로 내보내기 📊", disabled=True, use_container_width=True, key="t2_dl_disabled")
+
+
+# =================================================================
+# 탭③ 열피로가속 (Thermal Cycling)
+# =================================================================
+with tab3:
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.markdown("##### ③ 열피로가속 (Thermal Cycling)")
+        st.markdown('<p class="warn-text">※ 챔버 승온형 온도사이클(Thermal Cycling) 전용입니다. '
+                    '(엘리베이터형 Thermal Shock 시험은 전환시간이 거의 0으로, 별도 모델이 필요합니다)</p>',
+                    unsafe_allow_html=True)
+
+        def profile_group(title, defaults, key_prefix, has_target=False):
+            with st.container(border=True):
+                st.markdown(f"**{title}**")
+                low = st.number_input("저온(℃)", value=defaults["low"], key=f"{key_prefix}_low")
+                low_dwell = st.number_input("저온유지시간(분)", value=defaults["low_dwell"], key=f"{key_prefix}_ld")
+                ramp_up = st.number_input("승온시간(분, 저온→고온)", value=defaults["ramp_up"], key=f"{key_prefix}_ru")
+                high = st.number_input("고온(℃)", value=defaults["high"], key=f"{key_prefix}_high")
+                high_dwell = st.number_input("고온유지시간(분)", value=defaults["high_dwell"], key=f"{key_prefix}_hd")
+                ramp_down = st.number_input("하강시간(분, 고온→저온)", value=defaults["ramp_down"], key=f"{key_prefix}_rd")
+                target = None
+                if has_target:
+                    target = st.number_input("필드 목표 사이클수", value=defaults.get("target_cycle", 1000.0),
+                                              key=f"{key_prefix}_tc")
+                return dict(low=low, low_dwell=low_dwell, ramp_up=ramp_up, high=high,
+                            high_dwell=high_dwell, ramp_down=ramp_down, target_cycle=target)
+
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            field = profile_group("사용조건(필드) 사이클 프로파일",
+                                   dict(low=-40.0, low_dwell=10.0, ramp_up=30.0, high=85.0,
+                                        high_dwell=10.0, ramp_down=30.0, target_cycle=1000.0),
+                                   "t3_field", has_target=True)
+        with pc2:
+            test = profile_group("시험조건 사이클 프로파일",
+                                  dict(low=-40.0, low_dwell=10.0, ramp_up=30.0, high=125.0,
+                                       high_dwell=40.0, ramp_down=10.0),
+                                  "t3_test", has_target=False)
+
+        st.caption("예) -40℃(30분) ↔ 125℃(30분), 승온/하강 각 10분  형태로 입력하시면 됩니다.")
+
+        with st.container(border=True):
+            st.markdown("**가속 모델 선택**")
+            mc1, mc2 = st.columns([1, 1])
+            with mc1:
+                model_sel = st.radio("모델", options=["coffin", "norris"],
+                                      format_func=lambda v: "Coffin-Manson (단순, ΔT만 반영)" if v == "coffin"
+                                      else "Modified Norris-Landzberg (정밀, dwell/ramp/온도 반영)",
+                                      key="t3_model", label_visibility="collapsed")
+                mm1, mm2 = st.columns([1, 1])
+                m_val = mm1.number_input("m지수", value=2.5, step=0.1, key="t3_m")
+                with mm2:
+                    st.write("")
+                    with st.popover("m지수 가이드"):
+                        gdf = pd.DataFrame(rc.M_GUIDE_DB, columns=["재질/메커니즘", "m지수", "대상 부품(예)"])
+                        st.dataframe(gdf, use_container_width=True, height=180)
+                        gsel = st.selectbox("적용할 항목 선택", options=list(range(len(gdf))),
+                                             format_func=lambda i: f"{gdf.iloc[i]['재질/메커니즘']} (m={gdf.iloc[i]['m지수']})",
+                                             key="t3_m_select")
+                        if st.button("선택값 적용", key="t3_m_apply"):
+                            st.session_state["t3_m"] = float(gdf.iloc[gsel]["m지수"])
+                            st.rerun()
+            with mc2:
+                st.markdown("**언제 어떤 모델을 써야 하나요?**")
+                st.text(rc.MODEL_GUIDE_TEXT)
+
+        with st.container(border=True):
+            st.markdown("**Weibull 시험시간비 적용 (선택)**")
+            wb_apply3 = st.checkbox("적용", key="t3_wb_apply")
+            w1, w2, w3, w4 = st.columns(4)
+            r_var3 = w1.number_input("목표신뢰도 R", value=0.99, format="%.4f", key="t3_r")
+            cl_var3 = w2.number_input("신뢰수준 CL", value=0.5, format="%.4f", key="t3_cl")
+            n_var3 = w3.number_input("샘플수 n", value=6.0, step=1.0, key="t3_ns")
+            beta_var3 = w4.number_input("형상모수 β", value=2.0, step=0.1, key="t3_beta")
+
+        b1, b2 = st.columns(2)
+        calc_clicked3 = b1.button("계산 실행 ▶", type="primary", use_container_width=True, key="t3_calc")
+
+        if calc_clicked3:
+            dT_field = abs(field["high"] - field["low"])
+            dT_test = abs(test["high"] - test["low"])
+            cycle_time_field = rc.profile_cycle_time_min(field["low_dwell"], field["ramp_up"],
+                                                           field["high_dwell"], field["ramp_down"])
+            cycle_time_test = rc.profile_cycle_time_min(test["low_dwell"], test["ramp_up"],
+                                                          test["high_dwell"], test["ramp_down"])
+            if model_sel == "coffin":
+                af = rc.coffin_manson_af(dT_field, dT_test, m_val)
+            else:
+                ramp_test_rate = dT_test / test["ramp_up"] if test["ramp_up"] > 0 else 0.0001
+                af = rc.norris_landzberg_af(dT_field, dT_test, field["high_dwell"], test["high_dwell"],
+                                             ramp_test_rate, field["high"], test["high"])
+
+            target_cycle = field["target_cycle"] or 0
+            need_cycle = target_cycle / af if af > 0 else float("inf")
+            total_min = need_cycle * cycle_time_test
+            total_hour = total_min / 60
+            total_day = total_hour / 24
+
+            final_cycle = need_cycle
+            final_min = total_min
+            ratio = None
+            if wb_apply3:
+                try:
+                    ratio = rc.weibull_test_time_ratio(r_var3, cl_var3, n_var3, beta_var3)
+                    final_cycle = need_cycle * ratio
+                    final_min = final_cycle * cycle_time_test
+                except (ValueError, ZeroDivisionError):
+                    st.warning("Weibull 파라미터를 확인해주세요.")
+
+            st.session_state["t3_last"] = dict(dT_field=dT_field, dT_test=dT_test,
+                                                cycle_time_field=cycle_time_field, cycle_time_test=cycle_time_test,
+                                                af=af, need_cycle=need_cycle, total_min=total_min,
+                                                total_hour=total_hour, total_day=total_day, ratio=ratio,
+                                                final_cycle=final_cycle, final_min=final_min,
+                                                model=model_sel)
+
+        with right:
+            st.markdown("##### 결과")
+            last = st.session_state.get("t3_last")
+            if last:
+                lines = [
+                    f"ΔT(필드/시험) = {last['dT_field']:.1f}℃ / {last['dT_test']:.1f}℃",
+                    f"1cycle 시간(필드/시험) = {last['cycle_time_field']:.1f}분 / {last['cycle_time_test']:.1f}분",
+                    "",
+                    f"가속계수 AF = {last['af']:,.3f}",
+                    f"필요 시험 사이클수 = {last['need_cycle']:,.2f} cycle",
+                    f"총 소요시간 = {last['total_min']:,.1f}분 = {last['total_hour']:,.2f}시간 = {last['total_day']:,.2f}일",
+                ]
+                if last["ratio"] is not None:
+                    lines.append("")
+                    lines.append(f"Weibull 시험시간비 = {last['ratio']:.4f}")
+                    lines.append(f"최종 가속시험 사이클수 = {last['final_cycle']:,.2f} cycle "
+                                 f"({last['final_min']/60:,.2f}시간 = {last['final_min']/60/24:,.2f}일)")
+                result_box("\n".join(lines))
+            else:
+                result_box("프로파일을 입력하고 [계산 실행]을 눌러주세요.")
+
+            with st.expander("계산 공식", expanded=True):
+                if (last and last["model"] == "coffin") or (not last and model_sel == "coffin"):
+                    st.text(
+                        "[Coffin-Manson Model]\n\n"
+                        "AF = ( ΔT_test / ΔT_field ) ^ m\n\n"
+                        "여기서  AF : 가속계수\n"
+                        "        ΔT : 온도변화폭(사이클 최고온도-최저온도)\n"
+                        "        m  : 재료/구조에 따른 경험적 지수 (보통 1.9~5)\n\n"
+                        "필요 시험 사이클수 = 필드 목표 사이클수 / AF\n"
+                        "1cycle 시간 = 저온유지 + 승온시간 + 고온유지 + 하강시간\n"
+                        "총 소요시간 = 필요 시험 사이클수 x 1cycle 시간"
+                    )
+                else:
+                    st.text(
+                        "[Modified Norris-Landzberg Model]\n\n"
+                        "AF = (ΔT_test/ΔT_field)^2.65\n"
+                        "     x (Dwell_test/Dwell_field)^0.136\n"
+                        "     x (1.22 x RampRate_test^-0.0757)\n"
+                        "     x exp[2185 x (1/Tmax_field(K) - 1/Tmax_test(K))]\n\n"
+                        "여기서  Dwell : 고온유지시간,  RampRate : 승온속도(℃/분)\n"
+                        "        Tmax  : 사이클 최고온도(K)\n"
+                        "        (계수 n=2.65, m=0.136, Ea/k=2185 는 Pb-free 솔더 접합 문헌 기준 근사값)\n\n"
+                        "필요 시험 사이클수 = 필드 목표 사이클수 / AF\n"
+                        "1cycle 시간 = 저온유지 + 승온시간 + 고온유지 + 하강시간\n"
+                        "총 소요시간 = 필요 시험 사이클수 x 1cycle 시간"
+                    )
+
+            if last and HAS_OPENPYXL:
+                model_name = "Coffin-Manson" if last["model"] == "coffin" else "Modified Norris-Landzberg"
+                sheets = {
+                    "열피로가속(Thermal Cycling)": [
+                        ["항목", "값"],
+                        ["모델", model_name],
+                        ["ΔT_field(℃)", last["dT_field"]],
+                        ["ΔT_test(℃)", last["dT_test"]],
+                        ["가속계수 AF", last["af"]],
+                        ["필요 시험 사이클수", last["need_cycle"]],
+                        ["1cycle 시험시간(분)", last["cycle_time_test"]],
+                        ["총 소요시간(시간)", last["total_hour"]],
+                        ["총 소요시간(일)", last["total_day"]],
+                    ]
+                }
+                if last["ratio"] is not None:
+                    sheets["열피로가속(Thermal Cycling)"].extend([
+                        ["Weibull 시험시간비", last["ratio"]],
+                        ["최종 가속시험 사이클수", last["final_cycle"]],
+                        ["최종 가속시험시간(시간)", last["final_min"] / 60],
+                    ])
+                b2.download_button("엑셀로 내보내기 📊", df_to_excel_bytes(sheets),
+                                    file_name="열피로가속_계산결과.xlsx", use_container_width=True, key="t3_dl")
+            else:
+                b2.button("엑셀로 내보내기 📊", disabled=True, use_container_width=True, key="t3_dl_disabled")
+
+
+# =================================================================
+# 탭④ Weibull 시험시간비 계산기 + 참고 DB
+# =================================================================
+with tab4:
+    left, right = st.columns([2, 3])
+
+    with left:
+        st.markdown("##### ④ Weibull 시험시간비 계산기")
+
+        default_beta = st.session_state.get("t4_beta_override") or 2.0
+
+        with st.container(border=True):
+            st.markdown("**입력값**")
+            r4 = st.number_input("목표신뢰도 R", value=0.99, format="%.4f", key="t4_r")
+            cl4 = st.number_input("신뢰수준 CL", value=0.5, format="%.4f", key="t4_cl")
+            n4 = st.number_input("샘플수 n", value=6.0, step=1.0, key="t4_n")
+            beta4 = st.number_input("형상모수 β", value=float(default_beta), step=0.1, key="t4_beta")
+
+        with st.popover("Beta 참고DB 열기", use_container_width=True):
+            key = st.text_input("부품명 검색:", key="t4_db_search")
+            rows = [r for r in rc.WEIBULL_DB if key.strip().lower() in r[1].lower()] if key.strip() else rc.WEIBULL_DB
+            wdf = pd.DataFrame(rows, columns=["분류", "항목", "Beta Low", "Beta Typ", "Beta High",
+                                               "Eta Low", "Eta Typ", "Eta High"])
+            st.dataframe(wdf, use_container_width=True, height=300)
+            wsel = st.selectbox("적용할 항목 선택", options=list(range(len(wdf))),
+                                 format_func=lambda i: f"{wdf.iloc[i]['항목']} (β={wdf.iloc[i]['Beta Typ']})",
+                                 key="t4_db_select") if len(wdf) else None
+            if st.button("Beta(Typical) 값 적용", key="t4_db_apply") and wsel is not None:
+                st.session_state["t4_beta"] = float(wdf.iloc[wsel]["Beta Typ"])
+                st.rerun()
+
+        calc4 = st.button("계산 실행 ▶", type="primary", use_container_width=True, key="t4_calc")
+
+        if calc4:
+            try:
+                ratio4 = rc.weibull_test_time_ratio(r4, cl4, n4, beta4)
+                st.session_state["t4_result"] = ratio4
+            except (ValueError, ZeroDivisionError):
+                st.warning("값을 확인해주세요.")
+
+        if st.session_state.get("goto_tab4_msg"):
+            st.success(st.session_state["goto_tab4_msg"])
+            st.session_state["goto_tab4_msg"] = None
+
+    with right:
+        st.markdown("##### 결과")
+        ratio4 = st.session_state.get("t4_result")
+        if ratio4 is not None:
+            result_box(f"시험시간비 = {ratio4:.4f}")
         else:
-            st.warning("해당 항목의 통계 데이터가 없습니다.")
+            result_box("값을 입력하고 [계산 실행]을 눌러주세요.")
+
+        with st.expander("계산 공식", expanded=True):
+            st.text(
+                "시험시간비 = [ (-ln CL) / (n x -ln R) ] ^ (1/β)\n\n"
+                "최종 가속시험시간(또는 사이클수) = 등가시험시간(사이클수) x 시험시간비"
+            )
+
+
+# =================================================================
+# 탭⑤ 수명데이터 분석
+# =================================================================
+with tab5:
+    left, right = st.columns([2, 3])
+
+    with left:
+        st.markdown("##### ⑤ 수명데이터 분석 (Weibull)")
+
+        with st.container(border=True):
+            st.markdown("**고장/미고장 데이터 입력**")
+            rc1, rc2, rc3 = st.columns([1, 1, 1])
+            time_in5 = rc1.number_input("시간(h 또는 cycle)", min_value=0.0, value=0.0, step=1.0, key="t5_time_in")
+            status_in5 = rc2.radio("상태", options=["고장", "미고장"], key="t5_status_in", horizontal=True)
+            with rc3:
+                st.write("")
+                if st.button("추가 +", key="t5_add"):
+                    if time_in5 > 0:
+                        st.session_state.t5_rows.append((time_in5, status_in5 == "고장"))
+                    else:
+                        st.warning("시간을 올바르게 입력해주세요. (0보다 큰 값)")
+
+            st.caption("※ 미고장 = 관찰(시험) 종료 시점까지 고장이 발생하지 않은 데이터")
+
+            if st.session_state.t5_rows:
+                rows_df = pd.DataFrame(
+                    [(f"{t:.2f}", "고장" if f else "미고장") for t, f in st.session_state.t5_rows],
+                    columns=["시간", "상태"])
+                st.dataframe(rows_df, use_container_width=True, height=220)
+            else:
+                st.caption("입력된 데이터가 없습니다.")
+
+            bb1, bb2, bb3, bb4 = st.columns(4)
+            del_idx5 = bb1.number_input("삭제 행 번호(0부터)", min_value=0, value=0, step=1, key="t5_del_idx",
+                                         disabled=not st.session_state.t5_rows, label_visibility="collapsed")
+            if bb1.button("선택 삭제", key="t5_del_sel", disabled=not st.session_state.t5_rows):
+                if 0 <= int(del_idx5) < len(st.session_state.t5_rows):
+                    st.session_state.t5_rows.pop(int(del_idx5))
+                    st.rerun()
+            if bb2.button("전체 삭제", key="t5_del_all", disabled=not st.session_state.t5_rows):
+                st.session_state.t5_rows = []
+                st.session_state.t5_fit_result = None
+                st.rerun()
+            if bb3.button("예시데이터 불러오기", key="t5_example"):
+                example = [
+                    (185, True), (260, True), (312, True), (355, True), (398, True),
+                    (430, True), (470, True), (520, True), (610, True),
+                    (700, False), (700, False), (700, False), (700, False), (700, False), (700, False),
+                ]
+                st.session_state.t5_rows = example
+                st.rerun()
+
+        fit_clicked = st.button("Weibull 적합(MLE) 실행 ▶", type="primary", use_container_width=True, key="t5_fit")
+
+        if fit_clicked:
+            rows = st.session_state.t5_rows
+            if len(rows) < 3:
+                st.warning("데이터를 3개 이상 입력해주세요 (고장 데이터 2개 이상 포함).")
+            else:
+                times = [r[0] for r in rows]
+                is_failure = [r[1] for r in rows]
+                n_fail = sum(is_failure)
+                if n_fail < 2:
+                    st.warning("고장(Failure) 데이터가 2개 이상 필요합니다.")
+                else:
+                    result = rc.fit_weibull_mle(times, is_failure)
+                    if result is None:
+                        st.warning("Weibull 적합에 실패했습니다. 데이터를 확인해주세요.")
+                    else:
+                        st.session_state.t5_fit_result = result
+                        st.session_state.t5_times = times
+                        st.session_state.t5_is_failure = is_failure
+
+        # 엑셀 내보내기 버튼(항상 표시, 데이터 있을 때만 활성)
+        if HAS_OPENPYXL and st.session_state.t5_rows:
+            sheets = {
+                "수명데이터": [["시간", "상태"]] +
+                             [[t, "고장" if f else "미고장"] for t, f in st.session_state.t5_rows],
+            }
+            fr = st.session_state.t5_fit_result
+            fit_rows = [["항목", "값"]]
+            if fr is not None:
+                beta, eta = fr
+                fit_rows += [["형상모수 β", beta], ["척도모수 η", eta],
+                             ["MTTF(평균수명)", rc.weibull_mttf(beta, eta)],
+                             ["B10 수명", rc.weibull_bpercentile(beta, eta, 10)],
+                             ["B1 수명", rc.weibull_bpercentile(beta, eta, 1)]]
+            else:
+                fit_rows.append(["안내", "적합을 먼저 실행해주세요."])
+            sheets["적합결과"] = fit_rows
+            st.download_button("엑셀로 내보내기", df_to_excel_bytes(sheets),
+                                file_name="수명데이터분석_결과.xlsx", use_container_width=True, key="t5_dl")
+        else:
+            st.button("엑셀로 내보내기", disabled=True, use_container_width=True, key="t5_dl_disabled")
+
+    with right:
+        st.markdown("##### 적합 결과")
+        fr = st.session_state.t5_fit_result
+        if fr is not None:
+            beta, eta = fr
+            times = st.session_state.get("t5_times", [])
+            is_failure = st.session_state.get("t5_is_failure", [])
+            n_fail = sum(is_failure)
+            n_total = len(times)
+            if beta < 1.0:
+                interp = "β<1 : 초기고장(Infant Mortality) 특성 - 시간이 지날수록 고장률이 감소"
+            elif beta < 1.3:
+                interp = "β≈1 : 우발고장(Random Failure) 특성 - 고장률이 시간과 거의 무관"
+            else:
+                interp = "β>1 : 마모성고장(Wear-out) 특성 - 시간이 지날수록 고장률이 증가"
+            result_box(
+                f"형상모수 β = {beta:.4f}   척도모수 η = {eta:,.2f}\n"
+                f"(총 {n_total}개 데이터 : 고장 {n_fail}개 / 미고장 {n_total - n_fail}개)\n"
+                f"{interp}"
+            )
+        else:
+            result_box("데이터를 입력하고 [Weibull 적합(MLE) 실행]을 눌러주세요. (고장 데이터 2개 이상 필요)")
+
+        if st.button("이 β값을 ④ Weibull 탭으로 보내기 →", disabled=(fr is None), key="t5_send_beta"):
+            beta, eta = fr
+            st.session_state["t4_beta_override"] = beta
+            st.session_state["t4_beta"] = beta
+            st.session_state["goto_tab4_msg"] = f"β = {beta:.4f} 값을 ④ Weibull 시험시간비 탭으로 보냈습니다. (④ 탭에서 확인하세요)"
+            st.rerun()
+
+        st.markdown("**대표수명 지표 (MTTF / B10 / B1)**")
+        with st.popover("ⓘ 왜 필요한가?"):
+            st.text(
+                "β(형상모수)와 η(척도모수)만으로는 '이 제품이 실제로 몇 시간/사이클을 버티는지'가\n"
+                "바로 감이 오지 않기 때문에, 실무에서 바로 쓸 수 있는 대표수명값으로 변환한 지표입니다.\n\n"
+                "· MTTF (평균수명)\n"
+                "  전체 제품의 평균적인 고장 시점입니다. '평균적으로 이 정도 시간에 고장난다'는 의미이며,\n"
+                "  설계수명과 비교해 여유(마진)가 있는지 확인하는 데 씁니다.\n\n"
+                "· B10 수명\n"
+                "  전체 중 10%가 고장 나는 시점입니다. 자동차/전자부품 업계에서 널리 쓰이는\n"
+                "  표준 신뢰성 판정 지표로, '고객에게 보증할 수명'을 정할 때 기준으로 많이 사용합니다.\n\n"
+                "· B1 수명\n"
+                "  전체 중 1%가 고장 나는 시점입니다. B10보다 더 보수적인(엄격한) 기준이며,\n"
+                "  안전과 직결되는 부품이나 높은 신뢰성이 요구되는 부품에 사용합니다.\n\n"
+                "즉 세 지표 모두 β/η 모델을 '몇 % 고장 시점이 언제인지'로 쉽게 풀어서\n"
+                "리포트나 고객 스펙 비교에 바로 활용할 수 있게 해주는 값입니다."
+            )
+        if fr is not None:
+            beta, eta = fr
+            mttf = rc.weibull_mttf(beta, eta)
+            b10 = rc.weibull_bpercentile(beta, eta, 10)
+            b1 = rc.weibull_bpercentile(beta, eta, 1)
+            detail_box(f"MTTF(평균수명)   = {mttf:,.2f}\nB10 수명(F=10%) = {b10:,.2f}\nB1 수명(F=1%)   = {b1:,.2f}")
+        else:
+            detail_box("-")
+
+        st.markdown("**임의 시점 신뢰도 계산**")
+        with st.popover("ⓘ 왜 필요한가?"):
+            st.text(
+                "이 계산은 '시험을 얼마나 오래 했는지'와는 무관하게, 사용자가 알고 싶은\n"
+                "특정 시점(t) 하나를 골라서 그 시점의 신뢰도를 계산해주는 기능입니다.\n\n"
+                "예를 들어 시험 데이터를 1500시간까지 수집해 β/η을 추정해 놓은 상태에서:\n"
+                "  · t=200을 입력하면 → '200시간 시점까지 생존할 확률'\n"
+                "  · t=1500을 입력하면 → '시험 종료 시점까지 생존할 확률'\n"
+                "  · t=87600(필드수명 10년)을 입력하면 → '실제 필드수명 시점에서의 예상 생존율'\n"
+                "을 즉시 확인할 수 있습니다.\n\n"
+                "실무에서는 초기불량 구간(짧은 t) 확인, 시험 통과 확률의 사후 검증(시험시간과 같은 t),\n"
+                "그리고 필드 목표수명 시점의 신뢰도 예측(긴 t) 등의 용도로 가장 많이 사용합니다.\n\n"
+                "※ 주의: t가 실제 관측한 데이터 범위를 크게 벗어나면(외삽, extrapolation)\n"
+                "모델의 예측 오차가 커질 수 있으므로, 참고값으로만 활용하시기 바랍니다."
+            )
+        rt1, rt2 = st.columns([2, 1])
+        t_query = rt1.number_input("임의 시점 t =", value=1000.0, step=10.0, key="t5_t_query",
+                                    label_visibility="collapsed")
+        rt_calc = rt2.button("계산", key="t5_rt_calc", disabled=(fr is None))
+        if rt_calc and fr is not None:
+            beta, eta = fr
+            r_ = rc.weibull_reliability(t_query, beta, eta)
+            f_ = 1 - r_
+            h_ = rc.weibull_failure_rate(t_query, beta, eta)
+            st.session_state["t5_rt_text"] = (
+                f"R({t_query:g}) = {r_*100:.3f} %   (t시점까지 생존할 확률)\n"
+                f"F({t_query:g}) = {f_*100:.3f} %   (t시점까지 고장날 확률)\n"
+                f"h({t_query:g}) = {h_:.6f}   (t시점에서의 고장률)"
+            )
+        detail_box(st.session_state.get("t5_rt_text", "-"))
+
+        st.markdown("**Weibull 확률도표**")
+        if fr is not None:
+            beta, eta = fr
+            times = st.session_state.get("t5_times", [])
+            is_failure = st.session_state.get("t5_is_failure", [])
+            ranks = rc.weibull_rank_adjustment(times, is_failure)
+            fig, ax = plt.subplots(figsize=(6.2, 4.4), dpi=100)
+            if ranks:
+                xs = [math.log(t) for t, _ in ranks]
+                ys = [math.log(-math.log(1 - mr)) for _, mr in ranks]
+                ax.scatter(xs, ys, color="#2f6fed", label="관측 데이터(고장)")
+            tmin = min(times); tmax = max(times)
+            t_line = [tmin * (tmax / tmin) ** (i / 50.0) if tmin > 0 else tmax * i / 50.0 for i in range(51)]
+            x_line = [math.log(t) for t in t_line if t > 0]
+            y_line = [beta * (math.log(t) - math.log(eta)) for t in t_line if t > 0]
+            ax.plot(x_line, y_line, color="#e2483a", label=f"MLE 적합선 (β={beta:.2f}, η={eta:,.1f})")
+            ax.set_xlabel("ln(시간)")
+            ax.set_ylabel("ln(-ln(1-F))")
+            ax.set_title("Weibull 확률도표")
+            ax.legend(fontsize=8)
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            st.pyplot(fig)
+        else:
+            st.caption("적합을 실행하면 확률도표가 표시됩니다.")

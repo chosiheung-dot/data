@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-신뢰성분석 계산 로직 모듈
-- Arrhenius(온도가속) / Peck(온습도가속) / Coffin-Manson·Norris-Landzberg(열피로가속)
-- Weibull 무고장시험 시험시간비
-- Weibull MLE(중도절단=미고장 지원) + 확률도표(median rank) + MTTF/B10/B1/R(t)
-원본 데스크톱 프로그램(신뢰성분석.py)의 계산 로직을 그대로 옮긴 것으로,
-수치는 데스크톱 버전과 완전히 동일합니다.
+reliability_calc.py
+원본 데스크톱 프로그램(신뢰성분석.py, tkinter)의 계산 로직 + DB 데이터를
+UI 코드 없이 그대로 옮긴 순수 계산 모듈.
 """
 import math
 
 K_BOLTZMANN = 8.6173e-05  # eV/K
 
-# ------------------------------------------------------------------
-# DB
-# ------------------------------------------------------------------
+# ============================================================
+# DB : 활성화에너지 (Ea)
+# ============================================================
 EA_DB = [
     ('Capacitor, Aluminum Electrolytic', '0.81', 'EPRI NP-6408', 'Capacity Tol. 기준'),
     ('Capacitor, Mylar', '0.86', 'EPRI NP-6408', 'Capacity Tol. 기준'),
@@ -208,6 +205,9 @@ EA_DB = [
 
 ]
 
+# ============================================================
+# DB : Weibull Beta/Eta 참고값
+# ============================================================
 WEIBULL_DB = [
     ('Components', 'Ball bearings', 0.7, 1.3, 3.5, 14000.0, 40000.0, 250000.0),
     ('Components', 'Roller bearings', 0.7, 1.3, 3.5, 9000.0, 50000.0, 125000.0),
@@ -281,6 +281,9 @@ WEIBULL_DB = [
 
 ]
 
+# ============================================================
+# DB : Coffin-Manson m지수 선정 가이드
+# ============================================================
 M_GUIDE_DB = [
     ("무연솔더 적용 부품 Lead-free Solder(Sn97Ag3Cu0.5)", 2.65,
      "PCB 및 솔더링을 포함한 센서, 제어기류 (예: 무연솔더 적용 센서류)"),
@@ -294,190 +297,208 @@ M_GUIDE_DB = [
      "(예: 배기 매니폴드 등)"),
 ]
 
+MODEL_GUIDE_TEXT = """[ 언제 어떤 모델을 써야 하나요? ]
 
-# ------------------------------------------------------------------
-# ① 온도가속 (Arrhenius)
-# ------------------------------------------------------------------
-def arrhenius_af(ea_ev, t_use_c, t_test_c):
-    """활성화에너지(eV), 사용온도(℃), 시험온도(℃) -> 가속계수(AF)"""
-    Tu = t_use_c + 273.15
-    Tt = t_test_c + 273.15
-    af = math.exp(ea_ev / K_BOLTZMANN * (1.0 / Tu - 1.0 / Tt))
-    return af
+(1) Coffin-Manson (단순 모델)
+   - 반영 요소 : DeltaT(온도변화폭) 크기만 반영
+   - 적합 대상 : 플라스틱 하우징 균열/박리, 금속 접합부 균열 등 (Dwell 영향이 상대적으로 작은 구조)
+   - dwell time, ramp rate 데이터가 없거나 불확실할 때도 사용
 
+(2) Modified Norris-Landzberg (정밀 모델)
+   - 반영 요소 : DeltaT + 고온유지시간(Dwell) + 승온속도(Ramp) + 절대온도(Arrhenius항)
+   - 적합 대상 : 솔더 접합부(BGA/QFN 등 PCB 실장부품)의 저사이클 피로
+   - 계수(n=2.65, m=0.136, Ea/k=2185)는 Pb-free 솔더 접합 문헌 기준 근사값이므로,
+     다른 재질/구조에는 신뢰도가 낮을 수 있습니다.
 
-def arrhenius_test_time(field_hours, ea_ev, t_use_c, t_test_c):
-    af = arrhenius_af(ea_ev, t_use_c, t_test_c)
-    test_hours = field_hours / af
-    return af, test_hours
-
-
-# ------------------------------------------------------------------
-# ② 온습도가속 (Peck)
-# ------------------------------------------------------------------
-def peck_af(ea_ev, t_use_c, t_test_c, rh_use, rh_test, n_exp=2.7):
-    Tu = t_use_c + 273.15
-    Tt = t_test_c + 273.15
-    af_t = math.exp(ea_ev / K_BOLTZMANN * (1.0 / Tu - 1.0 / Tt))
-    af_h = (rh_use / rh_test) ** (-n_exp) if rh_test != 0 else float("inf")
-    # AF_total = (RH_test/RH_use)^n * exp[Ea/k (1/Tu - 1/Tt)]
-    af_rh = (rh_test / rh_use) ** n_exp if rh_use != 0 else float("inf")
-    af_total = af_rh * af_t
-    return af_total, af_t, af_rh
+* 판정 기준은 원칙적으로 '사이클 수' 입니다. 소요시간(분/시간/일)은 시험 스케줄링 참고용입니다.
+* 시험온도는 부품 정격범위, 유리전이온도(Tg), 솔더 융점을 넘지 않아야 하며,
+  유지시간은 DUT 내부/접합부 온도가 실제로 안정화되는 시간(통상 10~15분 이상) 이상이어야 합니다."""
 
 
-def peck_test_time(field_hours, ea_ev, t_use_c, t_test_c, rh_use, rh_test, n_exp=2.7):
-    af_total, af_t, af_rh = peck_af(ea_ev, t_use_c, t_test_c, rh_use, rh_test, n_exp)
-    test_hours = field_hours / af_total
-    return af_total, test_hours
+# ============================================================
+# 계산 함수 (온도가속/온습도가속/열피로가속/Weibull시험시간비)
+# ============================================================
+def celsius_to_kelvin(c):
+    return c + 273.15
 
 
-# ------------------------------------------------------------------
-# ③ 열피로가속 (Coffin-Manson / Norris-Landzberg)
-# ------------------------------------------------------------------
-def coffin_manson_af(dt_field, dt_test, m_exp):
-    """AF = (dT_test/dT_field)^m"""
-    return (dt_test / dt_field) ** m_exp
+def arrhenius_af(Tu_c, Ta_c, E):
+    Tu = celsius_to_kelvin(Tu_c)
+    Ta = celsius_to_kelvin(Ta_c)
+    return math.exp((E / K_BOLTZMANN) * (1.0 / Tu - 1.0 / Ta))
 
 
-def norris_landzberg_af(dt_field, dt_test, f_field, f_test, t_field_max_c, t_test_max_c,
-                         m_exp=2.5, ea_ev=0.12):
-    """Modified Norris-Landzberg AF = (dT_test/dT_field)^m * (f_test/f_field)^(-1/3) * exp[Ea/k(1/Tf-1/Tt)]"""
-    Tf = t_field_max_c + 273.15
-    Tt = t_test_max_c + 273.15
-    freq_term = (f_test / f_field) ** (-1.0/3.0) if f_field != 0 else 1.0
-    af = ((dt_test / dt_field) ** m_exp) * freq_term * math.exp(ea_ev / K_BOLTZMANN * (1.0 / Tf - 1.0 / Tt))
-    return af
+def peck_af(Tu_c, Hu, Ta_c, Ha, E, n):
+    Tu = celsius_to_kelvin(Tu_c)
+    Ta = celsius_to_kelvin(Ta_c)
+    return math.exp((E / K_BOLTZMANN) * (1.0 / Tu - 1.0 / Ta)) * ((Hu / Ha) ** (-n))
 
 
-def thermal_cycling_required_cycles(field_cycles, af):
-    return field_cycles / af
+def equiv_time_single(t_field, af):
+    """필드조건 시간(t_field)을 시험조건 시간으로 등가환산 (t_test = t_field / AF)"""
+    return t_field / af
 
 
-# ------------------------------------------------------------------
-# ④ Weibull 무고장시험 시험시간비
-# ------------------------------------------------------------------
-def weibull_test_ratio(R, CL, n, beta):
-    """
-    목표신뢰도 R, 신뢐수준 CL, 샘플수 n, 형상모수 beta ->
-    무고장시험 시험시간비(ratio) = (등가시험시간에 곱해줘야 하는 배수)
-    표준식: ratio = [ -ln(CL) / (n * (-ln(R))^... ) ] 형태의 카이제곱 기반 공식을
-    실무에서 널리 쓰는 형태로 구현.
-    ratio = ( ln(1-CL) 형태 ) 대신, 아래는 비율검정(무고장, r=0)에서
-    흔히 쓰이는 형태: ratio = [ -ln(1-CL) ]^(1/beta) 근사가 아니라
-    정확한 형태(카이제곱 2n 자유도, 신뢐수준 CL)로 계산한다.
-    """
-    # 무고장(r=0) Weibull 신뢐구간: 시험시간비 = [ chi2.ppf(CL, 2) / (2*n) ]^(1/beta) 를
-    # "요구되는 등가 사이클/시간 대비 실제 시험시간" 배수로 사용하는 표준 실무식
-    # ln(R) 목표를 만족시키기 위한 시험시간비:
-    ratio = (-math.log(CL) / (n * (-math.log(R)))) ** (1.0 / beta)
-    return ratio
+def weibull_test_time_ratio(R, CL, n_sample, beta):
+    """시험시간비 = [ (-ln CL) / (n * -ln R) ] ^ (1/beta) """
+    numer = -math.log(CL)
+    denom = n_sample * (-math.log(R))
+    return (numer / denom) ** (1.0 / beta)
 
 
-# ------------------------------------------------------------------
-# ⑤ 수명데이터 분석: Weibull MLE(중도절단=미고장 지원)
-# ------------------------------------------------------------------
-def _loglik_neg(params, times, is_failure):
-    beta, eta = params
-    if beta <= 0 or eta <= 0:
-        return 1e18
+def coffin_manson_af(dT_field, dT_test, m):
+    return (dT_test / dT_field) ** m
+
+
+def norris_landzberg_af(dT_field, dT_test, dwell_field, dwell_test,
+                          ramp_test, Tmax_field_c, Tmax_test_c):
+    Tmax_field_k = celsius_to_kelvin(Tmax_field_c)
+    Tmax_test_k = celsius_to_kelvin(Tmax_test_c)
+    term1 = (dT_test / dT_field) ** 2.65
+    term2 = (dwell_test / dwell_field) ** 0.136
+    term3 = 1.22 * (ramp_test ** -0.0757)
+    term4 = math.exp(2185.0 * (1.0 / Tmax_field_k - 1.0 / Tmax_test_k))
+    return term1 * term2 * term3 * term4
+
+
+def profile_cycle_time_min(low_dwell, ramp_up, high_dwell, ramp_down):
+    return low_dwell + ramp_up + high_dwell + ramp_down
+
+
+
+# ============================================================
+# 수명데이터 분석 (Weibull MLE, 확률도표, 파생지표)
+# ============================================================
+def _safe_ratio_pow(t, eta, beta):
+    """ (t/eta)**beta 를 로그공간에서 계산해 오버플로우를 방지 """
+    if t <= 0:
+        return 0.0
+    log_val = beta * (math.log(t) - math.log(eta))
+    if log_val > 700:
+        return math.inf
+    return math.exp(log_val)
+
+
+def _weibull_negloglik(params, times, is_failure):
+    """음의 로그우도함수 (고장/미고장 데이터 모두 반영). params=(log_beta, log_eta)"""
+    log_beta, log_eta = params
+    beta = math.exp(log_beta)
+    eta = math.exp(log_eta)
     ll = 0.0
     for t, f in zip(times, is_failure):
-        z = (t / eta) ** beta
+        r = _safe_ratio_pow(t, eta, beta)
         if f:
-            # log f(t) = log(beta/eta) + (beta-1)*log(t/eta) - (t/eta)^beta
-            if t <= 0:
-                return 1e18
-            ll += math.log(beta / eta) + (beta - 1.0) * math.log(t / eta) - z
+            if r == math.inf:
+                return 1e12
+            ll += math.log(beta / eta) + (beta - 1) * (math.log(t) - math.log(eta)) - r
         else:
-            # log R(t) = -(t/eta)^beta  (log-space로 안전하게)
-            ll += -z
+            ll += -1e6 if r == math.inf else -r
     return -ll
 
 
-def weibull_mle(times, is_failure, beta0=1.5, eta0=None):
-    """중도절단(미고장) 지원 Weibull MLE. scipy 없이 Nelder-Mead 유사 좌표하강으로 구현."""
-    times = [float(t) for t in times]
-    is_failure = [bool(f) for f in is_failure]
-    if eta0 is None:
-        eta0 = sum(times) / len(times) if times else 1.0
+def _nelder_mead(f, x0, max_iter=2000, tol=1e-10):
+    """scipy 없이 사용하는 간단한 2변수 Nelder-Mead 구현"""
+    n = len(x0)
+    step = 0.5
+    simplex = [list(x0)]
+    for i in range(n):
+        p = list(x0)
+        p[i] += step
+        simplex.append(p)
+    fvals = [f(p) for p in simplex]
 
-    # 간단한 격자탐색 + 미세조정(Nelder-Mead 대체: coordinate descent + golden-ish refine)
-    def obj(b, e):
-        return _loglik_neg((b, e), times, is_failure)
-
-    best_b, best_e = beta0, eta0
-    best_v = obj(best_b, best_e)
-
-    scales = [2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001]
-    for scale in scales:
-        improved = True
-        while improved:
-            improved = False
-            for db in (-scale, scale):
-                nb = best_b * (1 + db)
-                if nb <= 0.01:
-                    continue
-                v = obj(nb, best_e)
-                if v < best_v:
-                    best_v, best_b = v, nb
-                    improved = True
-            for de in (-scale, scale):
-                ne = best_e * (1 + de)
-                if ne <= 0.01:
-                    continue
-                v = obj(best_b, ne)
-                if v < best_v:
-                    best_v, best_e = v, ne
-                    improved = True
-    return best_b, best_e, best_v
-
-
-def median_rank(i, n):
-    """Bernard 근사: (i-0.3)/(n+0.4)"""
-    return (i - 0.3) / (n + 0.4)
+    for _ in range(max_iter):
+        order = sorted(range(len(simplex)), key=lambda i: fvals[i])
+        simplex = [simplex[i] for i in order]
+        fvals = [fvals[i] for i in order]
+        if abs(fvals[-1] - fvals[0]) < tol:
+            break
+        centroid = [sum(s[j] for s in simplex[:-1]) / n for j in range(n)]
+        worst = simplex[-1]
+        xr = [centroid[j] + 1.0 * (centroid[j] - worst[j]) for j in range(n)]
+        fr = f(xr)
+        if fr < fvals[0]:
+            xe = [centroid[j] + 2.0 * (centroid[j] - worst[j]) for j in range(n)]
+            fe = f(xe)
+            simplex[-1], fvals[-1] = (xe, fe) if fe < fr else (xr, fr)
+        elif fr < fvals[-2]:
+            simplex[-1], fvals[-1] = xr, fr
+        else:
+            xc = [centroid[j] + 0.5 * (worst[j] - centroid[j]) for j in range(n)]
+            fc = f(xc)
+            if fc < fvals[-1]:
+                simplex[-1], fvals[-1] = xc, fc
+            else:
+                best_pt = simplex[0]
+                for i in range(1, len(simplex)):
+                    simplex[i] = [best_pt[j] + 0.5 * (simplex[i][j] - best_pt[j]) for j in range(n)]
+                    fvals[i] = f(simplex[i])
+    order = sorted(range(len(simplex)), key=lambda i: fvals[i])
+    return simplex[order[0]], fvals[order[0]]
 
 
-def johnson_rank_adjustment(times, is_failure):
-    """중도절단(미고장) 데이터를 반영한 조정순위(Johnson's rank adjustment).
-    반환: [(time, adjusted_rank, median_rank_F), ...]  (고장 데이터만, 시간순)
+def fit_weibull_mle(times, is_failure):
+    """중도절단(미고장) 데이터를 지원하는 Weibull MLE 적합.
+    반환: (beta, eta) 또는 데이터 부족 시 None
     """
-    order = sorted(range(len(times)), key=lambda i: times[i])
-    n = len(times)
-    rows = []
+    fail_times = [t for t, f in zip(times, is_failure) if f]
+    if len(fail_times) < 2:
+        return None
+    log_t_mid = math.log(sorted(fail_times)[len(fail_times) // 2])
+
+    best = None
+    for beta0 in (0.5, 1.0, 2.0, 3.0, 5.0):
+        x0 = [math.log(beta0), log_t_mid]
+        res = _nelder_mead(lambda p: _weibull_negloglik(p, times, is_failure), x0)
+        if best is None or res[1] < best[1]:
+            best = res
+    log_beta, log_eta = best[0]
+    return math.exp(log_beta), math.exp(log_eta)
+
+
+def weibull_median_rank(order, n):
+    """Bernard 근사 median rank : (i-0.3)/(n+0.4)"""
+    return (order - 0.3) / (n + 0.4)
+
+
+def weibull_rank_adjustment(times, is_failure):
+    """미고장(중도절단) 데이터를 반영한 조정순위법(Johnson's Rank Adjustment).
+    반환: [(고장시간, median_rank), ...]  (고장 데이터만, 시간 오름차순)
+    """
+    order_data = sorted(zip(times, is_failure), key=lambda x: x[0])
+    n = len(order_data)
+    results = []
     prev_adj_rank = 0.0
     remaining = n
-    for rank_pos, idx in enumerate(order, start=1):
-        t = times[idx]
-        f = is_failure[idx]
-        reverse_rank = n - rank_pos + 1
-        if f:
-            increment = (n + 1 - prev_adj_rank) / (reverse_rank + 1)
-            adj_rank = prev_adj_rank + increment
-            prev_adj_rank = adj_rank
-            mr = median_rank(adj_rank, n)
-            rows.append((t, adj_rank, mr))
-    return rows
+    for t, is_f in order_data:
+        if is_f:
+            increment = (n + 1 - prev_adj_rank) / (remaining + 1)
+            prev_adj_rank = prev_adj_rank + increment
+            results.append((t, weibull_median_rank(prev_adj_rank, n)))
+        remaining -= 1
+    return results
 
 
-def mttf_weibull(beta, eta):
-    return eta * math.gamma(1.0 + 1.0 / beta)
+def weibull_mttf(beta, eta):
+    """평균수명 MTTF = eta * Gamma(1 + 1/beta)"""
+    return eta * math.gamma(1 + 1.0 / beta)
 
 
-def b_life(beta, eta, fraction):
-    """F(t)=fraction 이 되는 시점 (예: fraction=0.1 -> B10)"""
-    return eta * (-math.log(1.0 - fraction)) ** (1.0 / beta)
+def weibull_bpercentile(beta, eta, p_percent):
+    """B(p) 수명 : F(t)=p% 가 되는 시점"""
+    p = p_percent / 100.0
+    return eta * (-math.log(1 - p)) ** (1.0 / beta)
 
 
-def reliability_at(beta, eta, t):
-    return math.exp(-(t / eta) ** beta)
+def weibull_reliability(t, beta, eta):
+    """신뢰도 R(t) = exp[-(t/eta)^beta]"""
+    r = _safe_ratio_pow(t, eta, beta)
+    return 0.0 if r == math.inf else math.exp(-r)
 
 
-def cdf_at(beta, eta, t):
-    return 1.0 - reliability_at(beta, eta, t)
-
-
-def hazard_at(beta, eta, t):
+def weibull_failure_rate(t, beta, eta):
+    """고장률함수 h(t) = (beta/eta) * (t/eta)^(beta-1)"""
     if t <= 0:
-        return 0.0
-    return (beta / eta) * (t / eta) ** (beta - 1.0)
+        t = 1e-9
+    return (beta / eta) * (t / eta) ** (beta - 1)
+
