@@ -1,39 +1,26 @@
-# 가속시험 통합계산기 (신뢰성분석) - 웹앱
+# 가속시험 통합계산기 (신뢰성분석) 웹앱 v8
 
-원본 데스크톱 프로그램(tkinter)의 5개 탭 기능을 Streamlit 웹앱으로 재구성했습니다.
-- ① 온도가속 (Arrhenius)
-- ② 온습도가속 (Peck)
-- ③ 열피로가속 (Coffin-Manson / Norris-Landzberg)
-- ④ Weibull 시험시간비
-- ⑤ 수명데이터 분석 (Weibull MLE)
+원본 데스크톱 프로그램(`신뢰성분석.py`)의 계산 로직·DB·화면 구성을 **그대로** 재현한 Streamlit 웹앱입니다.
 
-## 이번 버전(v7) 변경사항
-1. **추세분석기(내구시험 Raw Data 분석) 기능 제거** — 추세분석기는 EXE로 별도 배포하므로 웹에서는 신뢰성분석만 제공합니다.
-2. 화면 상단 "원본 데스크톱 프로그램의 5개 탭을 그대로 재현했습니다" 안내 문구 삭제.
-3. DB 검색 등 작은 팝업(popover)이 좁게 뜨던 문제를 해결 — 아래 항목 전부 `st.dialog`(큰 모달, width="large")로 통일:
-   - ① 활성화에너지 DB 검색 / 왜 필요한가
-   - ② 활성화에너지 DB 검색
-   - ③ 모델 선택 가이드 / m지수 참고 가이드
-   - ④ Weibull β·η 참고 DB / 왜 필요한가
-   - ⑤ MTTF·B10·B1·R(t) 설명
+## 이번 버전에서 새로 맞춘 부분 (원본과 다르다고 하신 부분 전부 반영)
 
-## 파일 구성
-- `app.py` : Streamlit 메인 앱 (5개 탭 UI + 모달)
-- `reliability_calc.py` : 계산 로직(Arrhenius/Peck/Coffin-Manson/Norris-Landzberg/Weibull) + 참고 DB
-- `requirements.txt` : 의존 패키지 목록
+1. **조건 추가 표(테이블) 기능 복원**
+   - 탭①②: 온도/시간, 온도/습도/시간 조건을 하나씩 "추가 +" 하면 표에 쌓이는 원본 방식 그대로 구현
+   - 표에서 행을 선택(다중 선택 가능) 후 "선택 삭제 🗑" / "전체 삭제" 버튼으로 삭제
+2. **Weibull 시험시간비 적용(선택) 옵션 복원**
+   - 탭①②③ 모두에 원본과 동일하게 "적용" 체크박스 + 목표신뢰도 R / 신뢰수준 CL / 샘플수 n / 형상모수 β 입력란을 추가
+   - 체크 시 등가시험시간에 시험시간비를 곱해 "최종 가속시험시간"까지 계산
+3. **탭③ 열피로가속**: 필드/시험 프로파일을 좌우 50:50으로 배치(원본 구조와 동일), 모델 선택(Coffin-Manson/Norris-Landzberg) + m지수 가이드 버튼 + 오른쪽에 모델 설명 박스까지 구현
+4. **탭④ Weibull 시험시간비 계산기** 단독 탭 추가 (R/CL/n/β 입력 → 시험시간비 계산, Beta 참고DB 열람)
+5. **탭⑤ 수명데이터 분석**: 고장/미고장 데이터 입력·표·예시데이터, Weibull MLE 적합(β,η), MTTF/B10/B1, 임의 시점 R(t)/F(t)/h(t) 계산, Weibull 확률도표, "이 β값을 ④ 탭으로 보내기" 연동까지 구현
+6. **DB 검색/가이드 팝업은 큰 모달(전체 화면 크기)로 표시** (이전에 겪으신 "너무 작게 뜨는 문제" 해결)
+   - 활성화에너지 DB(190개), Weibull Beta/Eta 참고DB(69개), m지수 가이드(4개) 모두 큰 화면으로 조회
+7. **추세분석기(raw data 분석) 기능은 웹에서 완전히 제거** — 그 기능은 이제 EXE로 별도 배포
 
-## 로컬 실행 방법
-```
-pip install -r requirements.txt
-streamlit run app.py
-```
+## 구성 파일
+- `app.py` : Streamlit UI (5개 탭)
+- `reliability_calc.py` : 계산 함수 + DB (원본 파이썬 파일에서 그대로 이식)
+- `requirements.txt`
 
-## 업데이트 방법
-1. 화면 UI, 탭 구성, 버튼 등을 바꾸고 싶으면 → `app.py` 수정
-2. 계산식이나 DB(활성화에너지/Weibull β 참고값/m지수 가이드)를 바꾸고 싶으면 → `reliability_calc.py` 수정
-3. 새 패키지가 필요하면 → `requirements.txt`에 추가
-4. 수정한 파일을 GitHub 저장소(`chosiheung-dot/data`)에 업로드(Commit) → Streamlit Cloud가 자동으로 몇 분 내 재배포합니다.
-
-## 참고
-- `st.dialog`의 `width="large"` 옵션을 쓰기 위해 `requirements.txt`에서 `streamlit>=1.38`로 지정했습니다.
-- DB 값(활성화에너지/Weibull β/m지수)은 실무에서 자주 참고되는 대표값 예시이며, 실제 설계/품질 기준에 따라 조정해서 사용하세요.
+## 배포 방법
+GitHub 저장소(`chosiheung-dot/data`)에 `app.py`, `reliability_calc.py`, `requirements.txt` 3개 파일을 업로드(같은 이름은 자동 덮어쓰기) → Commit. Streamlit Cloud가 자동으로 재배포합니다.
